@@ -43,14 +43,14 @@ fn charlie_cypher(buffer: &mut [u8]) {
             | (chunk3 & 0xff000000);
         let new_chunk1 = (chunk2 >> 8 & 0xff00)
             | ((chunk3 & 0xff) << 0x10)
-            | (chunk3 >> 8)
+            | (chunk3 & 0xff00 >> 8)
             | ((chunk3 & 0xff0000) << 8);
         let new_chunk2 = (chunk0 << 0x18)
             | (chunk0 & 0xff00)
             | ((chunk1 << 8) & 0xff0000)
             | (chunk0 >> 0x10 & 0xff);
         let new_chunk3 = (chunk0 & 0xff000000)
-            | (chunk1 >> 8 & 0xff0000)
+            | (chunk1 >> 8 & 0xff0000) // done
             | (chunk1 >> 0x10 & 0xff)
             | (chunk1 << 0x8 & 0xff00);
 
@@ -87,7 +87,7 @@ fn charlie_cypher(buffer: &mut [u8]) {
         let reordered_bytes = [remainder[2], remainder[3], remainder[0], remainder[1]];
         remainder.copy_from_slice(&reordered_bytes);
     } else if remainder.len() == 2 {
-        let reordered_bytes = [remainder[1], remainder[2]];
+        let reordered_bytes = [remainder[1], remainder[0]];
         remainder.copy_from_slice(&reordered_bytes);
     }
 }
@@ -111,22 +111,22 @@ fn charlie_decypher(buffer: &mut [u8]) {
         let new_chunk2 = chunk2.rotate_left(11);
         let new_chunk3 = chunk3.rotate_left(15);
 
-        let chunk2 = ((new_chunk0 & 0xff00) >> 8)
-            | ((new_chunk0 & 0xff0000) >> 16)
-            | ((new_chunk0 & 0xff) << 24)
-            | (new_chunk0 & 0xff000000);
-        let chunk3 = ((new_chunk1 & 0xff00) << 8)
-            | ((new_chunk1 & 0xff0000) << 8)
-            | ((new_chunk1 & 0xff) << 8)
-            | (new_chunk1 >> 8);
         let chunk0 = (new_chunk2 >> 0x18)
             | (new_chunk2 & 0xff00)
-            | ((new_chunk2 >> 8) & 0xff0000)
-            | ((new_chunk2 & 0xff) << 0x10);
-        let chunk1 = (new_chunk3 >> 0x18)
-            | ((new_chunk3 >> 8) & 0xff00)
-            | ((new_chunk3 & 0xff) << 8)
-            | ((new_chunk3 & 0xff0000) >> 8);
+            | ((new_chunk2 & 0xff) << 0x10)
+            | (new_chunk3 & 0xff000000);
+        let chunk1 = ((new_chunk3 & 0xff00) >> 8)
+            | ((new_chunk2 & 0xff0000) >> 8)
+            | ((new_chunk3 & 0xff) << 0x10)
+            | ((new_chunk3 & 0xff0000) << 8);
+        let chunk2 = ((new_chunk0 >> 16) & 0xff)
+            | (new_chunk0 & 0xff00)
+            | ((new_chunk1 & 0xff00) << 8)
+            | (new_chunk0 << 24);
+        let chunk3 = ((new_chunk1 >> 0x10) & 0xff)
+            | ((new_chunk1 << 8) & 0xff00)
+            | ((new_chunk1 >> 8) & 0xff0000)
+            | (new_chunk0 & 0xff000000);
 
         let chunk0 = chunk0 ^ CHARLIE_CHUNKS[0];
         let chunk1 = chunk1 ^ CHARLIE_CHUNKS[1];
@@ -149,12 +149,12 @@ fn charlie_decypher(buffer: &mut [u8]) {
     if remainder.len() == 8 {
         let reordered_bytes = [
             remainder[7],
-            remainder[6],
-            remainder[3],
             remainder[4],
-            remainder[5],
+            remainder[3],
             remainder[2],
             remainder[1],
+            remainder[6],
+            remainder[5],
             remainder[0],
         ];
         remainder.copy_from_slice(&reordered_bytes);
@@ -162,7 +162,7 @@ fn charlie_decypher(buffer: &mut [u8]) {
         let reordered_bytes = [remainder[2], remainder[3], remainder[0], remainder[1]];
         remainder.copy_from_slice(&reordered_bytes);
     } else if remainder.len() == 2 {
-        let reordered_bytes = [remainder[1], remainder[0]];
+        let reordered_bytes = [remainder[0], remainder[1]];
         remainder.copy_from_slice(&reordered_bytes);
     }
 
@@ -173,4 +173,10 @@ fn charlie_decypher(buffer: &mut [u8]) {
 
 fn main() {
     println!("Hello, world!");
+    let mut buff : [u8; 24] = [0x4c,0x6f,0x8d,0x0c,0x40,0xd0,0x40,0xca,0x3d,0x2d,0xe8,0x2d,0xc0,0xee,0xca,0xd8,0x78,0xf2,0x8d,0x36,0xea,0x8d,0x04,0x01];
+    charlie_decypher(&mut buff);
+
+    for b in &buff {
+        print!("{b:02X} ");
+    }
 }
