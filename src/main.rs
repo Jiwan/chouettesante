@@ -1,4 +1,5 @@
 use std::iter::zip;
+use rand::prelude::*;
 
 const CHARLIE_STRING: &[u8; 32] = b"Charlie is the designer of P2P!!";
 const CHARLIE_CHUNKS: [u32; 8] = {
@@ -37,32 +38,32 @@ fn charlie_cypher(buffer: &mut [u8]) {
         let chunk2 = chunk2.rotate_right(9) ^ CHARLIE_CHUNKS[2];
         let chunk3 = chunk3.rotate_right(13) ^ CHARLIE_CHUNKS[3];
 
-        let new_chunk0 = (chunk2 & 0xff00) 
-            | ((chunk2 & 0xff) << 16) 
-            | (chunk2 >> 24) 
+        let new_chunk0 = (chunk2 >> 24)
+            | (chunk2 & 0xff00) 
+            | ((chunk2 & 0xff) << 16)
             | (chunk3 & 0xff000000);
-        let new_chunk1 = (chunk2 >> 8 & 0xff00)
+        let new_chunk1 = ((chunk3 & 0xff00) >> 8)
+            | ((chunk2 >> 8) & 0xff00)
             | ((chunk3 & 0xff) << 0x10)
-            | (chunk3 & 0xff00 >> 8)
             | ((chunk3 & 0xff0000) << 8);
         let new_chunk2 = (chunk0 << 0x18)
             | (chunk0 & 0xff00)
             | ((chunk1 << 8) & 0xff0000)
-            | (chunk0 >> 0x10 & 0xff);
+            | ((chunk0 >> 0x10) & 0xff);
         let new_chunk3 = (chunk0 & 0xff000000)
-            | (chunk1 >> 8 & 0xff0000) // done
-            | (chunk1 >> 0x10 & 0xff)
-            | (chunk1 << 0x8 & 0xff00);
+            | ((chunk1 >> 8) & 0xff0000)
+            | ((chunk1 >> 0x10) & 0xff)
+            | ((chunk1 << 0x8) & 0xff00);
 
-        let new_chunk0 = new_chunk0.rotate_right(3);
-        let new_chunk1 = new_chunk1.rotate_right(7);
-        let new_chunk2 = new_chunk2.rotate_right(11);
-        let new_chunk3 = new_chunk3.rotate_right(15);
+        let scrambled_chunk0 = new_chunk0.rotate_right(3);
+        let scrambled_chunk1 = new_chunk1.rotate_right(7);
+        let scrambled_chunk2 = new_chunk2.rotate_right(11);
+        let scrambled_chunk3 = new_chunk3.rotate_right(15);
 
-        slice0.copy_from_slice(&u32::to_le_bytes(new_chunk0));
-        slice1.copy_from_slice(&u32::to_le_bytes(new_chunk1));
-        slice2.copy_from_slice(&u32::to_le_bytes(new_chunk2));
-        slice3.copy_from_slice(&u32::to_le_bytes(new_chunk3));
+        slice0.copy_from_slice(&u32::to_le_bytes(scrambled_chunk0));
+        slice1.copy_from_slice(&u32::to_le_bytes(scrambled_chunk1));
+        slice2.copy_from_slice(&u32::to_le_bytes(scrambled_chunk2));
+        slice3.copy_from_slice(&u32::to_le_bytes(scrambled_chunk3));
     }
 
     let remainder = iter.into_remainder();
@@ -101,32 +102,33 @@ fn charlie_decypher(buffer: &mut [u8]) {
         let (slice2, rest) = rest.split_at_mut(std::mem::size_of::<u32>());
         let (slice3, _) = rest.split_at_mut(std::mem::size_of::<u32>());
 
-        let chunk0 = u32::from_le_bytes(slice0.try_into().unwrap());
-        let chunk1 = u32::from_le_bytes(slice1.try_into().unwrap());
-        let chunk2 = u32::from_le_bytes(slice2.try_into().unwrap());
-        let chunk3 = u32::from_le_bytes(slice3.try_into().unwrap());
+        let scrambled_chunk0 = u32::from_le_bytes(slice0.try_into().unwrap());
+        let scrambled_chunk1 = u32::from_le_bytes(slice1.try_into().unwrap());
+        let scrambled_chunk2 = u32::from_le_bytes(slice2.try_into().unwrap());
+        let scrambled_chunk3 = u32::from_le_bytes(slice3.try_into().unwrap());
 
-        let new_chunk0 = chunk0.rotate_left(3);
-        let new_chunk1 = chunk1.rotate_left(7);
-        let new_chunk2 = chunk2.rotate_left(11);
-        let new_chunk3 = chunk3.rotate_left(15);
+        let scrambled_chunk0 = scrambled_chunk0.rotate_left(3);
+        let scrambled_chunk1 = scrambled_chunk1.rotate_left(7);
+        let scrambled_chunk2 = scrambled_chunk2.rotate_left(11);
+        let scrambled_chunk3 = scrambled_chunk3.rotate_left(15);
 
-        let chunk0 = (new_chunk2 >> 0x18)
-            | (new_chunk2 & 0xff00)
-            | ((new_chunk2 & 0xff) << 0x10)
-            | (new_chunk3 & 0xff000000);
-        let chunk1 = ((new_chunk3 & 0xff00) >> 8)
-            | ((new_chunk2 & 0xff0000) >> 8)
-            | ((new_chunk3 & 0xff) << 0x10)
-            | ((new_chunk3 & 0xff0000) << 8);
-        let chunk2 = ((new_chunk0 >> 16) & 0xff)
-            | (new_chunk0 & 0xff00)
-            | ((new_chunk1 & 0xff00) << 8)
-            | (new_chunk0 << 24);
-        let chunk3 = ((new_chunk1 >> 0x10) & 0xff)
-            | ((new_chunk1 << 8) & 0xff00)
-            | ((new_chunk1 >> 8) & 0xff0000)
-            | (new_chunk0 & 0xff000000);
+        let chunk0 = (scrambled_chunk2 >> 0x18)
+            | (scrambled_chunk2 & 0xff00)
+            | ((scrambled_chunk2 & 0xff) << 0x10)
+            | (scrambled_chunk3 & 0xff000000);
+        let chunk1 = ((scrambled_chunk3 & 0xff00) >> 8)
+            | ((scrambled_chunk2 & 0xff0000) >> 8)
+            | ((scrambled_chunk3 & 0xff) << 0x10)
+            | ((scrambled_chunk3 & 0xff0000) << 8);
+        let chunk2 = ((scrambled_chunk0 >> 16) & 0xff)
+            | (scrambled_chunk0 & 0xff00)
+            | ((scrambled_chunk1 & 0xff00) << 8)
+            | (scrambled_chunk0 << 24);
+
+        let chunk3 = ((scrambled_chunk1 >> 0x10) & 0xff)
+            | ((scrambled_chunk1 << 8) & 0xff00)
+            | ((scrambled_chunk1 >> 8) & 0xff0000)
+            | (scrambled_chunk0 & 0xff000000);
 
         let chunk0 = chunk0 ^ CHARLIE_CHUNKS[0];
         let chunk1 = chunk1 ^ CHARLIE_CHUNKS[1];
@@ -162,7 +164,7 @@ fn charlie_decypher(buffer: &mut [u8]) {
         let reordered_bytes = [remainder[2], remainder[3], remainder[0], remainder[1]];
         remainder.copy_from_slice(&reordered_bytes);
     } else if remainder.len() == 2 {
-        let reordered_bytes = [remainder[0], remainder[1]];
+        let reordered_bytes = [remainder[1], remainder[0]];
         remainder.copy_from_slice(&reordered_bytes);
     }
 
@@ -171,12 +173,34 @@ fn charlie_decypher(buffer: &mut [u8]) {
     }
 }
 
+fn test_charlie_symmetry()
+{
+    let mut rng  = rand::thread_rng();
+
+    for _ in 1..10000
+    {
+        let mut random_vec = vec![0;rng.gen_range(1..1500)];
+        rng.fill_bytes(&mut random_vec);
+    
+        let expected_vec = random_vec.clone();  
+        
+        charlie_cypher(&mut random_vec);
+        charlie_decypher(&mut random_vec);
+
+        assert_eq!(random_vec, expected_vec);
+    }
+}
+
 fn main() {
-    println!("Hello, world!");
+    /*
     let mut buff : [u8; 24] = [0x4c,0x6f,0x8d,0x0c,0x40,0xd0,0x40,0xca,0x3d,0x2d,0xe8,0x2d,0xc0,0xee,0xca,0xd8,0x78,0xf2,0x8d,0x36,0xea,0x8d,0x04,0x01];
     charlie_decypher(&mut buff);
 
     for b in &buff {
         print!("{b:02X} ");
     }
+
+    */
+
+    test_charlie_symmetry();
 }
