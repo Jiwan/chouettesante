@@ -5,3 +5,9 @@ edition = "2021"
 
 [dependencies]
 rand = "0.8.5"
+anyhow = "1.0.95"
+thiserror = "2.0.11"
+
+[lib]
+name="chouettesante"
+crate-type = ["cdylib"]
