@@ -24,6 +24,20 @@ enum ParseError {
     InvalidCypheredContentSize,
 }
 
+use bitflags::bitflags;
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct PacketFlags: u8 {
+        const CypherExtendHeaderOnly = 0b0001;
+        const UnknownFlag0x2 = 0b0100;
+        const UnknownFlag0x4 = 0b0100;
+        const UnknownFlag0x8 = 0b1000;
+    }
+}
+
+
+
 pub fn parse(buffer: &mut [u8]) -> Result<()> {
     let mut buf = BufferReader::new(buffer);
     let record_magic_number = buf.read_le_u16()?;
@@ -58,10 +72,13 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
         return Err(ParseError::WrongVersion.into());
     }
 
-    let packet_type = reader.read_u8()?;
-    let packet_size = reader.read_le_u32()?;
+    let packet_flags = PacketFlags::from_bits_retain(reader.read_u8()?);
+    let packet_size = reader.read_le_u16()?;
+    let _ = reader.read_le_u16()?; // unknown
 
-    let cyphered_size = if (packet_type & 0x1) != 0 {
+    let cmd_type = reader.read_le_u16()?;
+
+    let cyphered_size = if packet_flags.contains(PacketFlags::CypherExtendHeaderOnly) {
         0x30
     } else {
         packet_size as usize
@@ -72,6 +89,22 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
     }
 
     decypher(&mut content[..cyphered_size]);
+
+    match cmd_type
+    {
+        0x408 => {
+            if packet_flags.contains(PacketFlags::UnknownFlag0x4) {
+                return Err(ParseError::InvalidCypheredContentSize.into());
+            }
+
+            let mut reader = BufferReader::new(content);
+            let extended_header_size= reader.read_le_u32()?;
+            reader.read_le_u32()?; // unknown
+            reader.read_le_u32()?; // unknown
+
+        }
+        _ => {}
+    }
 
     Ok(())
 }
