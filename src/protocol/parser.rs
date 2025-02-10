@@ -22,6 +22,10 @@ enum ParseError {
     WrongVersion,
     #[error("InvalidCypheredContentSize")]
     InvalidCypheredContentSize,
+    #[error("WrongFlagType")]
+    WrongFlagType,
+    #[error("InvalidSessionId")]
+    InvalidSessionId,
 }
 
 use bitflags::bitflags;
@@ -35,8 +39,6 @@ bitflags! {
         const UnknownFlag0x8 = 0b1000;
     }
 }
-
-
 
 pub fn parse(buffer: &mut [u8]) -> Result<()> {
     let mut buf = BufferReader::new(buffer);
@@ -90,18 +92,32 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
 
     decypher(&mut content[..cyphered_size]);
 
-    match cmd_type
-    {
+    match cmd_type {
         0x408 => {
             if packet_flags.contains(PacketFlags::UnknownFlag0x4) {
                 return Err(ParseError::InvalidCypheredContentSize.into());
             }
 
-            let mut reader = BufferReader::new(content);
-            let extended_header_size= reader.read_le_u32()?;
-            reader.read_le_u32()?; // unknown
-            reader.read_le_u32()?; // unknown
+            if content.len() < 0x0c {
+                return Err(ParseError::InvalidCypheredContentSize.into());
+            }
 
+            if !packet_flags.contains(PacketFlags::UnknownFlag0x8) {
+                // TODO
+            } else {
+                let mut reader = BufferReader::new(content);
+                let extended_header_size = reader.read_le_u32()? as usize;
+                let session1 = reader.read_le_u32()?; // unknown
+                let session2 = reader.read_le_u32()?; // unknown
+
+                if session1 == 0 {
+                    return Err(ParseError::InvalidSessionId.into());
+                }
+
+                // Search for session1 and session2 in gSessionInfo to extract the right session.
+
+                let content = &content[extended_header_size..];
+            }
         }
         _ => {}
     }
