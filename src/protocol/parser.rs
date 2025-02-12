@@ -26,6 +26,8 @@ enum ParseError {
     WrongFlagType,
     #[error("InvalidSessionId")]
     InvalidSessionId,
+    #[error("InvalidChannelId")]
+    InvalidChannelId,
 }
 
 use bitflags::bitflags;
@@ -76,9 +78,12 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
 
     let packet_flags = PacketFlags::from_bits_retain(reader.read_u8()?);
     let packet_size = reader.read_le_u16()?;
-    let _ = reader.read_le_u16()?; // unknown
+    let _unknown0x6 = reader.read_le_u16()?; // unknown
 
     let cmd_type = reader.read_le_u16()?;
+    let _ = reader.read_le_u32()?; // unknown
+    let channelId = reader.read_u8()?;
+    let _unknow0x15 = reader.read_u8()?; // unknown
 
     let cyphered_size = if packet_flags.contains(PacketFlags::CypherExtendHeaderOnly) {
         0x30
@@ -117,6 +122,12 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
                 // Search for session1 and session2 in gSessionInfo to extract the right session.
 
                 let content = &content[extended_header_size..];
+
+                if channelId >= 0x20 {
+                    return Err(ParseError::InvalidChannelId.into());
+                }
+
+                
             }
         }
         _ => {}
