@@ -1,13 +1,27 @@
-fn main() {
-    /*
-    let mut buff : [u8; 24] = [0x4c,0x6f,0x8d,0x0c,0x40,0xd0,0x40,0xca,0x3d,0x2d,0xe8,0x2d,0xc0,0xee,0xca,0xd8,0x78,0xf2,0x8d,0x36,0xea,0x8d,0x04,0x01];
-    charlie_decypher(&mut buff);
+use anyhow::{Result, Context};
+use authentication::firebase;
+use serde::Deserialize;
+mod authentication;
 
-    for b in &buff {
-        print!("{b:02X} ");
-    }
+#[derive(Deserialize)]
+pub struct Credentials {
+    pub email: String,
+    pub password: String,
+}
 
-    */
+fn load_credentials_from_file(file_path: &str) -> Result<Credentials> {
+    let file_content = std::fs::read_to_string(file_path).context("Failed to read credentials file")?;
+    let credentials: Credentials =
+        serde_json::from_str(&file_content).context("Failed to parse credentials JSON")?;
+    Ok(credentials)
+}
 
-    // test_charlie_symmetry();
+#[tokio::main]
+async fn main() -> Result<()> {
+    let credentials = load_credentials_from_file("credentials.json")?;
+    let response = firebase::authenticate(&credentials.email, &credentials.password).await?;
+
+    println!("Response: {:?}", response);
+
+    Ok(())
 }

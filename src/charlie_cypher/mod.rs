@@ -1,5 +1,7 @@
 use std::iter::zip;
 
+// Reversed from luffy and zoro in libIOCAPIs.so
+
 const CHARLIE_STRING: &[u8; 32] = b"Charlie is the designer of P2P!!";
 const CHARLIE_CHUNKS: [u32; 8] = {
     let mut res: [u32; 8] = [0, 0, 0, 0, 0, 0, 0, 0];

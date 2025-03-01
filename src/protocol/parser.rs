@@ -85,6 +85,7 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
     let channelId = reader.read_u8()?;
     let _unknow0x15 = reader.read_u8()?; // unknown
 
+    // From FUN_0004a770 in libIOTCAPIs.so
     let cyphered_size = if packet_flags.contains(PacketFlags::CypherExtendHeaderOnly) {
         0x30
     } else {
@@ -97,6 +98,7 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
 
     decypher(&mut content[..cyphered_size]);
 
+    // From: _IOTC_Packet_Handler in libIOTCAPIs.so
     match cmd_type {
         0x408 => {
             if packet_flags.contains(PacketFlags::UnknownFlag0x4) {
@@ -121,13 +123,18 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
 
                 // Search for session1 and session2 in gSessionInfo to extract the right session.
 
-                let content = &content[extended_header_size..];
-
                 if channelId >= 0x20 {
                     return Err(ParseError::InvalidChannelId.into());
                 }
 
-                
+                let content = &content[extended_header_size..];
+
+                let mut reader = BufferReader::new(content);
+                let _ = reader.read_u8()?; // unknown
+                let _ = reader.read_u8()?; // unknown
+                let _ = reader.read_le_u16()?; // unknown
+
+                // content == DTLS 1.2 packet
             }
         }
         _ => {}
@@ -135,3 +142,7 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
 
     Ok(())
 }
+
+
+// As a stream: https://docs.rs/ringbuf/latest/ringbuf/
+// Supplied to a SslStream: https://docs.rs/openssl/0.10.71/openssl/ssl/index.html
