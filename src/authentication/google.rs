@@ -98,8 +98,7 @@ fn fill_firebase_headers(headers: &mut HeaderMap) {
     );
 }
 
-pub async fn authenticate(email: &str, password: &str) -> Result<AuthResponse> {
-    let client = Client::new();
+pub async fn authenticate(client: &Client, email: &str, password: &str) -> Result<AuthResponse> {
     let request_body = AuthRequest {
         client_type: "CLIENT_TYPE_ANDROID".to_string(),
         email: email.to_string(),
@@ -149,9 +148,7 @@ pub struct RefreshTokenResponse {
     pub user_id: String,
 }
 
-pub async fn refresh_token(refresh_token: &str) -> Result<RefreshTokenResponse> {
-    let client = Client::new();
-
+pub async fn refresh_token(client: &Client, refresh_token: &str) -> Result<RefreshTokenResponse> {
     let request_body = RefreshTokenRequest {
         grant_type: "refresh_token".to_string(),
         refresh_token: refresh_token.to_string(),

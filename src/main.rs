@@ -1,5 +1,6 @@
 use anyhow::{Result, Context};
 use authentication::google;
+use reqwest::Client;
 use serde::Deserialize;
 use tracing::{Level, debug};
 use tracing_subscriber;
@@ -25,17 +26,19 @@ fn load_credentials_from_file(file_path: &str) -> Result<Credentials> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::DEBUG).init();
 
+    let reqwest_client = Client::new();
+
     let credentials = load_credentials_from_file("credentials.json")?;
-    let response = google::authenticate(&credentials.email, &credentials.password).await?;
+    let response = google::authenticate(&reqwest_client, &credentials.email, &credentials.password).await?;
 
     debug!("Authentication response: {:?}", response);
 
-    let refresh_token_response = google::refresh_token(&response.refresh_token).await?;
+    let refresh_token_response = google::refresh_token(&reqwest_client, &response.refresh_token).await?;
 
     debug!("Refresh token response: {:?}", refresh_token_response);
 
     let camera_kms_response =
-        authentication::camera_kms::authenticate(&refresh_token_response.access_token, &credentials.camera_id).await?;
+        authentication::camera_kms::authenticate(&reqwest_client, &refresh_token_response.access_token, &credentials.camera_id).await?;
 
     debug!("Camera KMS response: {:?}", camera_kms_response);
 

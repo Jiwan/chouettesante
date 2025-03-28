@@ -17,9 +17,7 @@ pub struct AuthResponse {
     pub tutkid: String
 }
 
-pub async fn authenticate(access_token: &str, camera_id: &str) -> Result<AuthResponse> {
-    let client = Client::new();
-
+pub async fn authenticate(client: &Client, access_token: &str, camera_id: &str) -> Result<AuthResponse> {
     let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, HeaderValue::from_str(access_token)?);
 
@@ -32,6 +30,10 @@ pub async fn authenticate(access_token: &str, camera_id: &str) -> Result<AuthRes
         .await?
         .json::<AuthResponse>()
         .await?;
+
+    if response.tutkid.len() != 20 {
+        return Err(anyhow::anyhow!("Invalid tutkid length: {}", response.tutkid.len()));
+    }
 
     Ok(response)
 }
