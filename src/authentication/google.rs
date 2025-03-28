@@ -139,14 +139,14 @@ struct RefreshTokenRequest {
 
 #[derive(Deserialize, Debug)]
 pub struct RefreshTokenResponse {
-    access_token: String,
+    pub access_token: String,
     #[serde(deserialize_with = "deserialize_duration_from_string")]
-    expires_in: Duration,
-    id_token: String,
-    project_id: String,
-    refresh_token: String,
-    token_type: String,
-    user_id: String,
+    pub expires_in: Duration,
+    pub id_token: String,
+    pub project_id: String,
+    pub refresh_token: String,
+    pub token_type: String,
+    pub user_id: String,
 }
 
 pub async fn refresh_token(refresh_token: &str) -> Result<RefreshTokenResponse> {
