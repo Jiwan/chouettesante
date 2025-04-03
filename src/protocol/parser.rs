@@ -1,13 +1,13 @@
-use std::cmp::min;
+use std::{io::Cursor};
 
-use crate::utils::BufferReader;
+use crate::utils::BinaryReader;
 
 use anyhow::{Context, Result};
 use thiserror::Error;
 
+use bitflags::bitflags;
+use super::constants;
 use crate::charlie_cypher::decypher;
-
-const RECORD_MAGIC_NUMBER: u16 = 0xcc51;
 
 const PACKET_MAGIC_NUMBER: u16 = 0x0204;
 const PACKET_HEADER_SIZE: usize = 0x10;
@@ -30,8 +30,6 @@ enum ParseError {
     InvalidChannelId,
 }
 
-use bitflags::bitflags;
-
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     struct PacketFlags: u8 {
@@ -43,11 +41,11 @@ bitflags! {
 }
 
 pub fn parse(buffer: &mut [u8]) -> Result<()> {
-    let mut buf = BufferReader::new(buffer);
+    let mut buf = Cursor::new(&mut *buffer);
     let record_magic_number = buf.read_le_u16()?;
 
     match record_magic_number {
-        RECORD_MAGIC_NUMBER => parse_record(buffer),
+        constants::RECORD_MAGIC_NUMBER => parse_record(buffer),
         _ => parse_packet(buffer),
     }
 }
@@ -63,7 +61,7 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
 
     decypher(header);
 
-    let mut reader = BufferReader::new(header);
+    let mut reader = Cursor::new(header);
     let magic_number = reader.read_le_u16()?;
 
     if magic_number != PACKET_MAGIC_NUMBER {
@@ -112,7 +110,7 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
             if !packet_flags.contains(PacketFlags::UnknownFlag0x8) {
                 // TODO
             } else {
-                let mut reader = BufferReader::new(content);
+                let mut reader: Cursor<&mut [u8]> = Cursor::new(content);
                 let extended_header_size = reader.read_le_u32()? as usize;
                 let session1 = reader.read_le_u32()?; // unknown
                 let session2 = reader.read_le_u32()?; // unknown
@@ -129,7 +127,7 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
 
                 let content = &content[extended_header_size..];
 
-                let mut reader = BufferReader::new(content);
+                let mut reader = Cursor::new(content);
                 let _ = reader.read_u8()?; // unknown
                 let _ = reader.read_u8()?; // unknown
                 let _ = reader.read_le_u16()?; // unknown

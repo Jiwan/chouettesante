@@ -179,10 +179,10 @@ mod tests {
 
     #[test]
     fn test_charlie_symmetry() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         for _ in 1..10000 {
-            let mut random_vec = vec![0; rng.gen_range(1..1500)];
+            let mut random_vec = vec![0; rng.random_range(1..1500)];
             rng.fill_bytes(&mut random_vec);
 
             let expected_vec = random_vec.clone();

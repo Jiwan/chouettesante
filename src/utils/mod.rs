@@ -1,3 +1,5 @@
-mod buffer_reader;
+mod binary_reader;
+mod binary_writer;
 
-pub use buffer_reader::BufferReader;
+pub use binary_reader::BinaryReader;
+pub use binary_writer::BinaryWriter;
