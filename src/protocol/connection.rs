@@ -1,8 +1,9 @@
-use openssl::{ec::EcKey, nid::Nid, rsa::Rsa};
+use openssl::{ec::EcKey, nid::Nid, rsa::{self, Rsa}};
 use rand::prelude::*;
 
 use serde::{Deserialize, Serialize};
 use serde_json;
+use tokio::io::AsyncWriteExt;
 
 use crate::utils::BinaryWriter;
 
@@ -33,20 +34,53 @@ fn get_master_domain_name(region: MasterRegion) -> String {
     );
 }
 
-fn rsa_encrypt() {
+fn rsa_encrypt(from: &[u8], to: &mut [u8]) -> usize {
+    // From TUTK3rdRSAEncrypt in libTUTKGlobalAPIs.so.
     let rsa_key = Rsa::public_key_from_pem(constants::PUB_RSA_KEY.as_bytes()).unwrap();
-    rsa_key.size();
+
+    let modulus: usize = rsa_key.size() as usize;
+    let padded_size = from.len().next_multiple_of(modulus);
+
+    // Note that this padding strategy is horrifying.
+    // It should be something like PKCS padding, but it is what the original code does.
+    let mut padded_from = Vec::with_capacity(padded_size);
+    padded_from.extend_from_slice(from);
+    padded_from.resize(padded_size, 0);
+
+    for (chunk_from, chunk_to) in padded_from.chunks(modulus).zip(to.chunks_mut(modulus)) {
+        rsa_key.public_encrypt(chunk_from, chunk_to, rsa::Padding::NONE).unwrap();
+    }
+
+    padded_size
 }
 
-pub fn recordSendMasterHandshake(session_id: u32) -> () {
+pub fn record_send_master_handshake(session_id: u32) -> std::io::Result<()> {
+    // From iotcRecordSendMasterHandshake in libIOTCAPIs.so.
     let rsa_encrypted_size = 0;
 
     let mut packet = Vec::with_capacity(constants::RECORD_PACKET_MAX_SIZE);
     packet.write_le_u16(constants::RECORD_MAGIC_NUMBER)?;
-    packet.write_u8(1)?;
-    packet.write_u8(1)?;
+    packet.write_le_u16(0)?;
+    BinaryWriter::write_u8(&mut packet, 1)?;
+    BinaryWriter::write_u8(&mut packet, 1)?;
     packet.write_le_u16(rsa_encrypted_size)?;
     packet.write_le_u32(session_id)?;
+
+    assert!(packet.len() == constants::RECORD_HEADER_SIZE);
+    packet.resize(constants::RECORD_PACKET_MAX_SIZE, 0);
+
+    let mut payload = Vec::with_capacity(0x58);
+    payload.write_le_u16(0x204)?;
+    BinaryWriter::write_u8(&mut payload, 0x1d)?;
+    BinaryWriter::write_u8(&mut payload, 0x0)?;
+    
+    payload.resize(0x58, 0);
+
+
+    let encrypted_size = rsa_encrypt(&payload, &mut packet[constants::RECORD_HEADER_SIZE..]);
+    packet.truncate(constants::RECORD_HEADER_SIZE + encrypted_size);
+
+    Ok(())
 }
 
 pub fn connect(region: MasterRegion, uid: &str) -> () {
