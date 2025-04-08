@@ -1,14 +1,17 @@
 use std::io::{Cursor, Seek};
 
 use openssl::{
-    ec::EcKey, encrypt, nid::Nid, rsa::{self, Rsa}
+    ec::EcKey,
+    encrypt,
+    nid::Nid,
+    rsa::{self, Rsa},
 };
 use rand::prelude::*;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json;
-use tokio::net::lookup_host;
+use tokio::net::{lookup_host, UdpSocket};
 
 use crate::utils::BinaryWriter;
 
@@ -22,20 +25,25 @@ pub enum MasterRegion {
     ASIA,
 }
 
+fn get_realm() -> &'static str {
+    // Technically, the realm is more complicated than this and must be extracted from the nebulaDomainFromLicense you get in SetLicenseKey.
+    // But that involves decrypting the licensee key and that feels unnecessary for now.
+    // It seems that all suffixes end-up mapping to the same domain name.
+    return "tutk.iotcplatform.com";
+}
+
 fn get_master_domain_name(region: MasterRegion) -> String {
     // See GetMasterDomainName in libTUTKGlobalAPIs.so
     let master_type = "c-master";
 
-    // Technically, the suffix is more complicated than this and must be extracted from the nebulaDomainFromLicense you get in SetLicenseKey.
-    // But that involves decrypting the licensee key and that feels unnecessary for now.
-    // It seems that all suffixes end-up mapping to the same domain name.
-    let suffix = "tutk.iotcplatform.com";
-
     return format!(
         "{}-{}-{}",
-        serde_json::to_string(&region).unwrap().trim_matches('"').to_lowercase(),
+        serde_json::to_string(&region)
+            .unwrap()
+            .trim_matches('"')
+            .to_lowercase(),
         master_type,
-        suffix
+        get_realm()
     );
 }
 
@@ -61,7 +69,12 @@ fn rsa_encrypt(from: &[u8], to: &mut [u8]) -> usize {
     padded_size
 }
 
-pub fn record_send_master_handshake(session_id: u32, uid: [u8;20],  nonce1: u16, aes_seed : [u8; 28]) -> std::io::Result<()> {
+pub fn make_record_send_master_handshake(
+    session_id: u32,
+    uid: [u8; 20],
+    nonce1: u16,
+    aes_seed: [u8; 28],
+) -> std::io::Result<Vec<u8>> {
     // From iotcRecordSendMasterHandshake in libIOTCAPIs.so.
     let rsa_encrypted_size = 0;
 
@@ -92,11 +105,10 @@ pub fn record_send_master_handshake(session_id: u32, uid: [u8;20],  nonce1: u16,
     payload_cursor.write_le_u16(0x0)?;
     payload_cursor.write_bytes(&aes_seed)?;
     payload_cursor.write_bytes(&uid)?;
-    // TODO: See GetRealm.
+    payload_cursor.write_bytes(&get_realm().as_bytes()[0..0x10])?;
+    payload_cursor.write_u8(0x6)?;
+    payload_cursor.write_u8((session_id == 0xffff) as u8)?;
 
-    payload_cursor.write_le_u16(0x0)?; 
-
-    
     let encrypted_size = rsa_encrypt(&payload, &mut packet[constants::RECORD_HEADER_SIZE..]);
     let mut packet_cursor = Cursor::new(&mut packet);
     packet_cursor.set_position(rsa_encrypted_size_offset);
@@ -104,7 +116,7 @@ pub fn record_send_master_handshake(session_id: u32, uid: [u8;20],  nonce1: u16,
 
     packet.truncate(constants::RECORD_HEADER_SIZE + encrypted_size);
 
-    Ok(())
+    Ok(packet)
 }
 
 pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
@@ -126,13 +138,28 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
         let curve = EcKey::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
     }
 
-    let socket_address = lookup_host((master_domain_name.as_str(), 0))
+    let socket_address = lookup_host((master_domain_name.as_str(), 10240))
         .await?
         .next()
         .context(format!(
             "Failed to resolve master domain {}",
             master_domain_name
         ))?;
+
+    let record = make_record_send_master_handshake(
+        session_id,
+        uid.as_bytes().try_into()?,
+        nonce1,
+        aes_seed,
+    )?;
+
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket.send_to(&record, socket_address).await?;
+
+    let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
+    socket.recv_from(&mut buf).await?;
+
+    println!("Received response: {:?}", buf);
 
     Ok(())
 }
