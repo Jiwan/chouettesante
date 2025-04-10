@@ -10,7 +10,7 @@ mod charlie_cypher;
 mod utils;
 mod protocol;
 
-use protocol::connection::{connect, MasterRegion};
+use protocol::iotc_record::{connect, MasterRegion};
 
 #[derive(Deserialize)]
 pub struct Credentials {

@@ -1,3 +1,3 @@
 pub mod parser;
-pub mod connection;
+pub mod iotc_record;
 mod constants;

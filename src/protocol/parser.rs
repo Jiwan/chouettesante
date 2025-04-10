@@ -8,6 +8,7 @@ use thiserror::Error;
 use bitflags::bitflags;
 use super::constants;
 use crate::charlie_cypher::decypher;
+use super::iotc_record;
 
 const PACKET_MAGIC_NUMBER: u16 = 0x0204;
 const PACKET_HEADER_SIZE: usize = 0x10;
@@ -42,16 +43,12 @@ bitflags! {
 
 pub fn parse(buffer: &mut [u8]) -> Result<()> {
     let mut buf = Cursor::new(&mut *buffer);
-    let record_magic_number = buf.read_le_u16()?;
+    let record_magic_number = buf.read_le_u32()?;
 
     match record_magic_number {
-        constants::RECORD_MAGIC_NUMBER => parse_record(buffer),
+        constants::RECORD_MAGIC_NUMBER => iotc_record::parse(buffer, [0; 16], [0; 12]),
         _ => parse_packet(buffer),
     }
-}
-
-fn parse_record(buffer: &mut [u8]) -> Result<()> {
-    Ok(())
 }
 
 pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {

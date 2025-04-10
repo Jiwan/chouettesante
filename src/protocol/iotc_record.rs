@@ -1,21 +1,49 @@
-use std::io::{Cursor, Seek};
+use std::{
+    any,
+    io::{Cursor, Seek},
+};
 
 use openssl::{
     ec::EcKey,
     encrypt,
     nid::Nid,
     rsa::{self, Rsa},
+    symm::{Cipher, Crypter, Mode},
 };
 use rand::prelude::*;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json;
+use thiserror::Error;
 use tokio::net::{lookup_host, UdpSocket};
 
+use crate::utils::BinaryReader;
 use crate::utils::BinaryWriter;
 
 use super::constants;
+
+#[repr(u8)]
+enum RecordType {
+    Handshake = 0x1,
+}
+
+#[derive(Error, Debug)]
+enum RecordConversionError {
+    #[error("InvalidRecordType")]
+    InvalidRecordType,
+}
+
+impl TryFrom<u8> for RecordType {
+    type Error = RecordConversionError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x1 => Ok(RecordType::Handshake),
+            _ => Err(RecordConversionError::InvalidRecordType),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum MasterRegion {
@@ -73,17 +101,17 @@ pub fn make_record_send_master_handshake(
     session_id: u32,
     uid: [u8; 20],
     nonce1: u16,
-    aes_seed: [u8; 28],
+    aes_key: [u8; 16],
+    aes_iv: [u8; 12],
 ) -> std::io::Result<Vec<u8>> {
     // From iotcRecordSendMasterHandshake in libIOTCAPIs.so.
     let rsa_encrypted_size = 0;
 
     let mut packet = vec![0; constants::RECORD_PACKET_MAX_SIZE];
     let mut packet_cursor = Cursor::new(&mut packet);
-    packet_cursor.write_le_u16(constants::RECORD_MAGIC_NUMBER)?;
-    packet_cursor.write_le_u16(0)?;
+    packet_cursor.write_le_u32(constants::RECORD_MAGIC_NUMBER)?;
     packet_cursor.write_u8(1)?;
-    packet_cursor.write_u8(1)?;
+    packet_cursor.write_u8(RecordType::Handshake as u8)?;
     let rsa_encrypted_size_offset = packet_cursor.position();
     packet_cursor.write_le_u16(rsa_encrypted_size)?;
     packet_cursor.write_le_u32(session_id)?;
@@ -103,7 +131,8 @@ pub fn make_record_send_master_handshake(
     payload_cursor.write_le_u16(0x0)?;
     payload_cursor.write_le_u16(nonce1)?;
     payload_cursor.write_le_u16(0x0)?;
-    payload_cursor.write_bytes(&aes_seed)?;
+    payload_cursor.write_bytes(&aes_key)?;
+    payload_cursor.write_bytes(&aes_iv)?;
     payload_cursor.write_bytes(&uid)?;
     payload_cursor.write_bytes(&get_realm().as_bytes()[0..0x10])?;
     payload_cursor.write_u8(0x6)?;
@@ -119,6 +148,70 @@ pub fn make_record_send_master_handshake(
     Ok(packet)
 }
 
+#[derive(Error, Debug)]
+enum DecryptError {
+    #[error("AuthenticationFailed")]
+    AuthenticationFailed,
+}
+
+fn decrypt_aes_128_gcm(
+    ciphertext: &[u8],
+    aad: &[u8],
+    tag: &[u8],
+    aes_key: [u8; 16],
+    aes_iv: [u8; 12],
+) -> Result<Vec<u8>, DecryptError> {
+    // From TUTK3rdAESDecryptEx in libTUTKGlobalAPIs.so.
+    // https://wiki.openssl.org/index.php/EVP_Authenticated_Encryption_and_Decryption
+
+    let cipher = Cipher::aes_128_gcm();
+    let mut crypter = Crypter::new(cipher, Mode::Decrypt, &aes_key, Some(&aes_iv)).unwrap();
+
+    crypter.aad_update(aad).unwrap();
+    crypter.set_tag(tag).unwrap();
+
+    let mut plaintext = vec![0; ciphertext.len() + cipher.block_size()];
+    let mut count = crypter.update(ciphertext, &mut plaintext).unwrap();
+
+    match crypter.finalize(&mut plaintext[count..]) {
+        Ok(n) => {
+            count += n;
+            plaintext.truncate(count);
+            Ok(plaintext)
+        }
+        Err(_) => Err(DecryptError::AuthenticationFailed),
+    }
+}
+
+pub fn parse(buffer: &[u8], aes_key: [u8; 16], aes_iv: [u8; 12]) -> Result<()> {
+    // From iotcRecordHandler in libIOTCAPIs.so.
+    assert!(buffer.len() >= constants::RECORD_HEADER_SIZE);
+    assert!(buffer.len() <= constants::RECORD_PACKET_MAX_SIZE);
+
+    let mut cursor = Cursor::new(buffer);
+    let record_magic_number = cursor.read_le_u32()?;
+
+    assert!(record_magic_number == constants::RECORD_MAGIC_NUMBER);
+
+    let _ = cursor.read_u8()?;
+    let record_type: RecordType = cursor.read_u8()?.try_into()?;
+    let record_size = cursor.read_le_u16()? as usize;
+    let session_id = cursor.read_le_u32()?;
+
+    // Assuming header (aad) | payload | tag
+    //          0x0c         |   ...   | 0x10
+    let add = &buffer[0..constants::RECORD_HEADER_SIZE];
+    let ciphertext = &buffer[constants::RECORD_HEADER_SIZE
+        ..constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE];
+    let tag = &buffer
+        [constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE..];
+    let result = decrypt_aes_128_gcm(ciphertext, add, tag, aes_key, aes_iv)?;
+
+    println!("Decrypted payload:");
+    crate::utils::hexdump(&result);
+    Ok(())
+}
+
 pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     // From IOTC_Connect_UDP_Inner in libIOTCAPIs.so
     let uid: String = uid.to_lowercase();
@@ -127,8 +220,11 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     let nonce1 = rand::random::<u16>();
     let nonce2 = rand::random::<u16>();
 
-    let mut aes_seed: [u8; 28] = [0; 28];
-    rand::fill(&mut aes_seed);
+    let mut aes_key: [u8; 16] = [0; 16];
+    rand::fill(&mut aes_key);
+
+    let mut aes_iv: [u8; 12] = [0; 12];
+    rand::fill(&mut aes_iv);
 
     let master_domain_name = get_master_domain_name(region);
 
@@ -138,7 +234,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
         let curve = EcKey::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
     }
 
-    let socket_address = lookup_host((master_domain_name.as_str(), 10240))
+    let send_addr = lookup_host((master_domain_name.as_str(), 10240))
         .await?
         .next()
         .context(format!(
@@ -150,16 +246,22 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
         session_id,
         uid.as_bytes().try_into()?,
         nonce1,
-        aes_seed,
+        aes_key,
+        aes_iv,
     )?;
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    socket.send_to(&record, socket_address).await?;
+    socket.send_to(&record, send_addr).await?;
 
     let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
-    socket.recv_from(&mut buf).await?;
+    let (usize, recv_addr) = socket.recv_from(&mut buf).await?;
+    buf.truncate(usize);
 
-    println!("Received response: {:?}", buf);
+    assert!(send_addr == recv_addr);
+
+    println!("Received response: {:?} {}", buf, buf.len());
+
+    parse(&buf, aes_key, aes_iv)?;
 
     Ok(())
 }
