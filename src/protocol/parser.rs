@@ -46,7 +46,7 @@ pub fn parse(buffer: &mut [u8]) -> Result<()> {
     let record_magic_number = buf.read_le_u32()?;
 
     match record_magic_number {
-        constants::RECORD_MAGIC_NUMBER => iotc_record::parse(buffer, [0; 16], [0; 12]),
+        constants::RECORD_MAGIC_NUMBER => iotc_record::parse(buffer, [0; 16], [0; 12]), // Those keys and ivs should be adjusted.
         _ => parse_packet(buffer),
     }
 }
@@ -130,6 +130,8 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
                 let _ = reader.read_le_u16()?; // unknown
 
                 // content == DTLS 1.2 packet
+                // As a stream: https://docs.rs/ringbuf/latest/ringbuf/
+                // Supplied to a SslStream: https://docs.rs/openssl/0.10.71/openssl/ssl/index.html
             }
         }
         _ => {}
@@ -137,7 +139,3 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
 
     Ok(())
 }
-
-
-// As a stream: https://docs.rs/ringbuf/latest/ringbuf/
-// Supplied to a SslStream: https://docs.rs/openssl/0.10.71/openssl/ssl/index.html

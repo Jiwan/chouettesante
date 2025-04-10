@@ -1,5 +1,6 @@
 use std::{
     any,
+    collections::HashMap,
     io::{Cursor, Seek},
 };
 
@@ -97,13 +98,7 @@ fn rsa_encrypt(from: &[u8], to: &mut [u8]) -> usize {
     padded_size
 }
 
-pub fn make_record_send_master_handshake(
-    session_id: u32,
-    uid: [u8; 20],
-    nonce1: u16,
-    aes_key: [u8; 16],
-    aes_iv: [u8; 12],
-) -> std::io::Result<Vec<u8>> {
+pub fn make_record_send_master_handshake(session: &IotcSession) -> std::io::Result<Vec<u8>> {
     // From iotcRecordSendMasterHandshake in libIOTCAPIs.so.
     let rsa_encrypted_size = 0;
 
@@ -114,7 +109,7 @@ pub fn make_record_send_master_handshake(
     packet_cursor.write_u8(RecordType::Handshake as u8)?;
     let rsa_encrypted_size_offset = packet_cursor.position();
     packet_cursor.write_le_u16(rsa_encrypted_size)?;
-    packet_cursor.write_le_u32(session_id)?;
+    packet_cursor.write_le_u32(session.session_id)?;
 
     assert!(packet_cursor.position() as usize == constants::RECORD_HEADER_SIZE);
 
@@ -129,14 +124,14 @@ pub fn make_record_send_master_handshake(
     payload_cursor.write_le_u16(0x18)?;
     payload_cursor.write_le_u16(0x0)?;
     payload_cursor.write_le_u16(0x0)?;
-    payload_cursor.write_le_u16(nonce1)?;
+    payload_cursor.write_le_u16(session.nonce1)?;
     payload_cursor.write_le_u16(0x0)?;
-    payload_cursor.write_bytes(&aes_key)?;
-    payload_cursor.write_bytes(&aes_iv)?;
-    payload_cursor.write_bytes(&uid)?;
+    payload_cursor.write_bytes(&session.aes_key)?;
+    payload_cursor.write_bytes(&session.aes_iv)?;
+    payload_cursor.write_bytes(&session.device_id)?;
     payload_cursor.write_bytes(&get_realm().as_bytes()[0..0x10])?;
     payload_cursor.write_u8(0x6)?;
-    payload_cursor.write_u8((session_id == 0xffff) as u8)?;
+    payload_cursor.write_u8((session.session_id == 0xffff) as u8)?;
 
     let encrypted_size = rsa_encrypt(&payload, &mut packet[constants::RECORD_HEADER_SIZE..]);
     let mut packet_cursor = Cursor::new(&mut packet);
@@ -146,6 +141,67 @@ pub fn make_record_send_master_handshake(
     packet.truncate(constants::RECORD_HEADER_SIZE + encrypted_size);
 
     Ok(packet)
+}
+
+struct IotcSession {
+    session_id: u32,
+    device_id: [u8; 20],
+    aes_key: [u8; 16],
+    aes_iv: [u8; 12],
+    nonce1: u16,
+    nonce2: u16,
+}
+
+impl IotcSession {
+    fn new(session_id: u32, uid: &str) -> Result<Self> {
+        let device_id: String = uid.to_lowercase();
+        let nonce1 = rand::random::<u16>();
+        let nonce2 = rand::random::<u16>();
+
+        let mut aes_key: [u8; 16] = [0; 16];
+        rand::fill(&mut aes_key);
+
+        let mut aes_iv: [u8; 12] = [0; 12];
+        rand::fill(&mut aes_iv);
+
+        Ok(Self {
+            session_id,
+            device_id: device_id.as_bytes().try_into()?,
+            aes_key: [0; 16],
+            aes_iv,
+            nonce1,
+            nonce2,
+        })
+    }
+}
+
+pub struct IotcSessionManager {
+    sessions: HashMap<u32, IotcSession>,
+    session_id_counter: u32,
+}
+
+impl IotcSessionManager {
+    fn new() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            session_id_counter: 0,
+        }
+    }
+
+    fn create_session(&mut self, uid: &str) -> &mut IotcSession {
+        self.session_id_counter += 1;
+        self.sessions
+            .entry(self.session_id_counter)
+            .or_insert_with(|| IotcSession::new(self.session_id_counter, uid).unwrap())
+    }
+
+    fn get_session(&self, session_id: u32) -> Option<&IotcSession> {
+        self.sessions.get(&session_id)
+    }
+
+    fn get_session_mut(&mut self, session_id: u32) -> Option<&mut IotcSession> {
+        self.sessions.get_mut(&session_id)
+    }
 }
 
 #[derive(Error, Debug)]
@@ -183,6 +239,33 @@ fn decrypt_aes_128_gcm(
     }
 }
 
+fn parse_record_handshake<T>(
+    buffer: &[u8],
+    cursor: &mut Cursor<T>,
+    aes_key: [u8; 16],
+    aes_iv: [u8; 12],
+) -> Result<()>
+where
+    T: AsRef<[u8]>,
+{
+    let record_size = cursor.read_le_u16()? as usize;
+    let session_id = cursor.read_le_u32()?;
+
+    // Layout: header (aad) | payload | tag
+    // Size:     0x0c       |   ...   | 0x10
+    let add = &buffer[0..constants::RECORD_HEADER_SIZE];
+    let ciphertext = &buffer[constants::RECORD_HEADER_SIZE
+        ..constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE];
+    let tag =
+        &buffer[constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE..];
+    let result = decrypt_aes_128_gcm(ciphertext, add, tag, aes_key, aes_iv)?;
+
+    println!("Decrypted payload:");
+    crate::utils::hexdump(&result);
+
+    Ok(())
+}
+
 pub fn parse(buffer: &[u8], aes_key: [u8; 16], aes_iv: [u8; 12]) -> Result<()> {
     // From iotcRecordHandler in libIOTCAPIs.so.
     assert!(buffer.len() >= constants::RECORD_HEADER_SIZE);
@@ -195,36 +278,21 @@ pub fn parse(buffer: &[u8], aes_key: [u8; 16], aes_iv: [u8; 12]) -> Result<()> {
 
     let _ = cursor.read_u8()?;
     let record_type: RecordType = cursor.read_u8()?.try_into()?;
-    let record_size = cursor.read_le_u16()? as usize;
-    let session_id = cursor.read_le_u32()?;
 
-    // Assuming header (aad) | payload | tag
-    //          0x0c         |   ...   | 0x10
-    let add = &buffer[0..constants::RECORD_HEADER_SIZE];
-    let ciphertext = &buffer[constants::RECORD_HEADER_SIZE
-        ..constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE];
-    let tag = &buffer
-        [constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE..];
-    let result = decrypt_aes_128_gcm(ciphertext, add, tag, aes_key, aes_iv)?;
-
-    println!("Decrypted payload:");
-    crate::utils::hexdump(&result);
+    match record_type {
+        RecordType::Handshake => {
+            parse_record_handshake(&buffer, &mut cursor, aes_key, aes_iv)?;
+        }
+        _ => return Err(anyhow::anyhow!("Invalid record type")),
+    }
     Ok(())
 }
 
 pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     // From IOTC_Connect_UDP_Inner in libIOTCAPIs.so
-    let uid: String = uid.to_lowercase();
 
-    let session_id: u32 = 0;
-    let nonce1 = rand::random::<u16>();
-    let nonce2 = rand::random::<u16>();
-
-    let mut aes_key: [u8; 16] = [0; 16];
-    rand::fill(&mut aes_key);
-
-    let mut aes_iv: [u8; 12] = [0; 12];
-    rand::fill(&mut aes_iv);
+    let mut session_manager = IotcSessionManager::new();
+    let session = session_manager.create_session(uid);
 
     let master_domain_name = get_master_domain_name(region);
 
@@ -242,13 +310,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
             master_domain_name
         ))?;
 
-    let record = make_record_send_master_handshake(
-        session_id,
-        uid.as_bytes().try_into()?,
-        nonce1,
-        aes_key,
-        aes_iv,
-    )?;
+    let record = make_record_send_master_handshake(&session)?;
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.send_to(&record, send_addr).await?;
@@ -261,7 +323,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     println!("Received response: {:?} {}", buf, buf.len());
 
-    parse(&buf, aes_key, aes_iv)?;
+    parse(&buf, session.aes_key, session.aes_iv)?;
 
     Ok(())
 }
