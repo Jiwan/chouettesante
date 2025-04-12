@@ -6,9 +6,8 @@ use anyhow::{Context, Result};
 use thiserror::Error;
 
 use bitflags::bitflags;
-use super::constants;
 use crate::charlie_cypher::decypher;
-use super::iotc_record;
+use super::{constants, iotc_record};
 
 const PACKET_MAGIC_NUMBER: u16 = 0x0204;
 const PACKET_HEADER_SIZE: usize = 0x10;
@@ -46,7 +45,7 @@ pub fn parse(buffer: &mut [u8]) -> Result<()> {
     let record_magic_number = buf.read_le_u32()?;
 
     match record_magic_number {
-        constants::RECORD_MAGIC_NUMBER => iotc_record::parse(buffer, [0; 16], [0; 12]), // Those keys and ivs should be adjusted.
+        constants::RECORD_MAGIC_NUMBER => {Ok(())}, // TODO call parse_record with the right session.
         _ => parse_packet(buffer),
     }
 }

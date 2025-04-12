@@ -1,7 +1,7 @@
 use std::{
     any,
     collections::HashMap,
-    io::{Cursor, Seek},
+    io::{Cursor, Read, Seek},
 };
 
 use openssl::{
@@ -115,11 +115,10 @@ pub fn make_record_send_master_handshake(session: &IotcSession) -> std::io::Resu
 
     let mut payload = vec![0; 0x58];
     let mut payload_cursor = Cursor::new(&mut payload);
-    payload_cursor.write_le_u16(0x204)?;
+    payload_cursor.write_le_u16(constants::HANDSHAKE_MAGIC_NUMBER)?;
     payload_cursor.write_u8(0x1d)?;
     payload_cursor.write_u8(0x0)?;
-    payload_cursor.write_le_u16(0x48)?;
-    payload_cursor.write_le_u16(0x0)?;
+    payload_cursor.write_le_u32(0x48)?;
     payload_cursor.write_le_u16(0x100b)?;
     payload_cursor.write_le_u16(0x18)?;
     payload_cursor.write_le_u16(0x0)?;
@@ -242,14 +241,15 @@ fn decrypt_aes_128_gcm(
 fn parse_record_handshake<T>(
     buffer: &[u8],
     cursor: &mut Cursor<T>,
-    aes_key: [u8; 16],
-    aes_iv: [u8; 12],
+    session: &IotcSession,
 ) -> Result<()>
 where
     T: AsRef<[u8]>,
 {
     let record_size = cursor.read_le_u16()? as usize;
     let session_id = cursor.read_le_u32()?;
+
+    assert!(session_id == session.session_id);
 
     // Layout: header (aad) | payload | tag
     // Size:     0x0c       |   ...   | 0x10
@@ -258,15 +258,60 @@ where
         ..constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE];
     let tag =
         &buffer[constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE..];
-    let result = decrypt_aes_128_gcm(ciphertext, add, tag, aes_key, aes_iv)?;
+    let result = decrypt_aes_128_gcm(ciphertext, add, tag, session.aes_key, session.aes_iv)?;
 
     println!("Decrypted payload:");
     crate::utils::hexdump(&result);
 
+    let mut payload_cursor = Cursor::new(&result);
+    let handshake_magic_number = payload_cursor.read_le_u16()?;
+    assert!(handshake_magic_number == constants::HANDSHAKE_MAGIC_NUMBER);
+    let _ = payload_cursor.read_u8()?;
+    let _ = payload_cursor.read_u8()?;
+    let len = payload_cursor.read_le_u32()?;
+    assert!(((len + 0x1c) as usize) < constants::RECORD_PACKET_MAX_SIZE);
+    let unknown = payload_cursor.read_le_u16()?;
+    assert!(unknown == 0x100c);
+    payload_cursor.seek_relative(6)?;
+    let nonce = payload_cursor.read_le_u16()?;
+    assert!(nonce == session.nonce1);
+    let _ = payload_cursor.read_le_u16()?;
+    let uid = payload_cursor.read_bytes::<20>()?;
+    assert!(uid == session.device_id);
+
+    payload_cursor.seek(std::io::SeekFrom::Start(0x4a))?;
+    let entry_count = payload_cursor.read_le_u16()?;
+    assert!(entry_count != 0);
+
+    for _ in 0..entry_count {
+        let entry_type = payload_cursor.read_le_u16()?;
+        let entry_size = payload_cursor.read_le_u16()? as u64;
+        let entry_offset = payload_cursor.position();
+
+        match entry_type {
+            9 => {
+                /* server entries or something */
+                let server_count = entry_size / 0x6C;
+
+                for _ in 0..server_count {
+                    let _ = payload_cursor.read_le_u16()?;
+                    let _ = payload_cursor.read_le_u16()?;
+                    let ip_address = payload_cursor.read_le_u32()?;
+                    let _ = payload_cursor.read_le_u64()?;
+                    // TODO: read ec key
+                }
+            }
+            1 => {}
+            _ => {}
+        }
+
+        payload_cursor.set_position(entry_offset + entry_size);
+    }
+
     Ok(())
 }
 
-pub fn parse(buffer: &[u8], aes_key: [u8; 16], aes_iv: [u8; 12]) -> Result<()> {
+pub fn parse(buffer: &[u8], session: &IotcSession) -> Result<()> {
     // From iotcRecordHandler in libIOTCAPIs.so.
     assert!(buffer.len() >= constants::RECORD_HEADER_SIZE);
     assert!(buffer.len() <= constants::RECORD_PACKET_MAX_SIZE);
@@ -281,7 +326,7 @@ pub fn parse(buffer: &[u8], aes_key: [u8; 16], aes_iv: [u8; 12]) -> Result<()> {
 
     match record_type {
         RecordType::Handshake => {
-            parse_record_handshake(&buffer, &mut cursor, aes_key, aes_iv)?;
+            parse_record_handshake(&buffer, &mut cursor, session)?;
         }
         _ => return Err(anyhow::anyhow!("Invalid record type")),
     }
@@ -323,7 +368,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     println!("Received response: {:?} {}", buf, buf.len());
 
-    parse(&buf, session.aes_key, session.aes_iv)?;
+    parse(&buf, &session)?;
 
     Ok(())
 }
