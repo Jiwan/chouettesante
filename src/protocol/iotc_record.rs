@@ -5,11 +5,7 @@ use std::{
 };
 
 use openssl::{
-    ec::EcKey,
-    encrypt,
-    nid::Nid,
-    rsa::{self, Rsa},
-    symm::{Cipher, Crypter, Mode},
+    ec::EcKey, encrypt, nid::Nid, pkey::PKey, rsa::{self, Rsa}, symm::{Cipher, Crypter, Mode}
 };
 use rand::prelude::*;
 
@@ -18,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use thiserror::Error;
 use tokio::net::{lookup_host, UdpSocket};
+use tracing::{debug, info, warn};
 
 use crate::utils::BinaryReader;
 use crate::utils::BinaryWriter;
@@ -294,15 +291,34 @@ where
                 let server_count = entry_size / 0x6C;
 
                 for _ in 0..server_count {
-                    let _ = payload_cursor.read_le_u16()?;
+                    let test = payload_cursor.read_le_u16()?;
+                    info!("Server test: {}", test);
                     let _ = payload_cursor.read_le_u16()?;
                     let ip_address = payload_cursor.read_le_u32()?;
                     let _ = payload_cursor.read_le_u64()?;
-                    // TODO: read ec key
+                    
+                    let mut der_key = [0; 0x5c];
+                    payload_cursor.read_exact(&mut der_key)?;
+                    let pub_key = PKey::public_key_from_der(& der_key)?;
+
+                    debug!("Server IP: {}.{}.{}.{}, pub_key: {:?}",
+                        ip_address & 0xFF,
+                        (ip_address >> 8) & 0xFF,
+                        (ip_address >> 16) & 0xFF,
+                        (ip_address >> 24) & 0xFF,
+                        pub_key
+                    );
                 }
             }
-            1 => {}
-            _ => {}
+            1 => {
+                let _unknown1 = payload_cursor.read_le_u16()?;
+                let _unknown2 = payload_cursor.read_le_u16()?;
+                let _unknown3 = payload_cursor.read_le_u16()?;
+                // It looks like those 3 short are reversed: unknown3, unknown2, unknown1.
+            }
+            _ => {
+                warn!("Unknown entry type: {}", entry_type);
+            }
         }
 
         payload_cursor.set_position(entry_offset + entry_size);
