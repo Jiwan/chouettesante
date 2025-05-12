@@ -23,7 +23,8 @@ use super::constants;
 
 #[repr(u8)]
 enum RecordType {
-    Handshake = 0x1,
+    MasterHandshake = 0x1,
+    P2PHandshake = 0x2,
 }
 
 #[derive(Error, Debug)]
@@ -37,7 +38,7 @@ impl TryFrom<u8> for RecordType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0x1 => Ok(RecordType::Handshake),
+            0x1 => Ok(RecordType::MasterHandshake),
             _ => Err(RecordConversionError::InvalidRecordType),
         }
     }
@@ -103,7 +104,7 @@ pub fn make_record_send_master_handshake(session: &IotcSession) -> std::io::Resu
     let mut packet_cursor = Cursor::new(&mut packet);
     packet_cursor.write_le_u32(constants::RECORD_MAGIC_NUMBER)?;
     packet_cursor.write_u8(1)?;
-    packet_cursor.write_u8(RecordType::Handshake as u8)?;
+    packet_cursor.write_u8(RecordType::MasterHandshake as u8)?;
     let rsa_encrypted_size_offset = packet_cursor.position();
     packet_cursor.write_le_u16(rsa_encrypted_size)?;
     packet_cursor.write_le_u32(session.session_id)?;
@@ -137,6 +138,34 @@ pub fn make_record_send_master_handshake(session: &IotcSession) -> std::io::Resu
     packet.truncate(constants::RECORD_HEADER_SIZE + encrypted_size);
 
     Ok(packet)
+}
+
+fn make_record_send_p2p_init_handshake_req(session: &IotcSession) -> std::io::Result<Vec<u8>>
+{
+    // From iotcRecordSendP2PInitHandshakeReq in libIOTCAPIs.so.
+
+    let mut packet = vec![0; constants::RECORD_PACKET_MAX_SIZE];
+    let mut packet_cursor = Cursor::new(&mut packet);
+    packet_cursor.write_le_u32(constants::RECORD_MAGIC_NUMBER)?;
+
+}
+
+fn make_hello_server(session: &IotcSession) -> std::io::Result<Vec<u8>> {
+    // From HelloServer in libIOTCAPIs.so.
+
+    let content_len = 0x8;
+    let packet_flags = 0x2;
+
+    let mut packet = vec![0; constants::RECORD_PACKET_MAX_SIZE];
+    let mut packet_cursor = Cursor::new(&mut packet);
+    packet_cursor.write_le_u16(constants::PACKET_MAGIC_NUMBER)?;
+    packet_cursor.write_u8(constants::PACKET_VERSION)?;
+    packet_cursor.write_u8(packet_flags)?;
+    packet_cursor.write_le_u16(content_len)?;
+    packet_cursor.write_le_u16(0x0)?;
+    packet_cursor.write_le_u16(0x8003)?; // cmd
+    packet_cursor.write_le_u16(0x3f)?;
+    // TODO: continue.
 }
 
 struct IotcSession {
@@ -262,7 +291,7 @@ where
 
     let mut payload_cursor = Cursor::new(&result);
     let handshake_magic_number = payload_cursor.read_le_u16()?;
-    assert!(handshake_magic_number == constants::HANDSHAKE_MAGIC_NUMBER);
+    assert!(handshake_magic_number == constants::PACKET_MAGIC_NUMBER);
     let _ = payload_cursor.read_u8()?;
     let _ = payload_cursor.read_u8()?;
     let len = payload_cursor.read_le_u32()?;
@@ -341,7 +370,7 @@ pub fn parse(buffer: &[u8], session: &IotcSession) -> Result<()> {
     let record_type: RecordType = cursor.read_u8()?.try_into()?;
 
     match record_type {
-        RecordType::Handshake => {
+        RecordType::MasterHandshake => {
             parse_record_handshake(&buffer, &mut cursor, session)?;
         }
         _ => return Err(anyhow::anyhow!("Invalid record type")),

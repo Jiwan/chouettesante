@@ -7,9 +7,8 @@ use thiserror::Error;
 
 use bitflags::bitflags;
 use crate::charlie_cypher::decypher;
-use super::{constants, iotc_record};
+use super::{constants::{self, PACKET_MAGIC_NUMBER}, iotc_record};
 
-const PACKET_MAGIC_NUMBER: u16 = 0x0204;
 const PACKET_HEADER_SIZE: usize = 0x10;
 
 #[derive(Error, Debug)]
@@ -60,13 +59,13 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
     let mut reader = Cursor::new(header);
     let magic_number = reader.read_le_u16()?;
 
-    if magic_number != PACKET_MAGIC_NUMBER {
+    if magic_number != constants::PACKET_MAGIC_NUMBER {
         return Err(ParseError::WrongPacketMagicNumber.into());
     }
 
     let version = reader.read_u8()?;
 
-    if version != 0x1d {
+    if version != constants::PACKET_VERSION {
         return Err(ParseError::WrongVersion.into());
     }
 
