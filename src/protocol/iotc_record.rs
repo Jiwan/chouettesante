@@ -7,7 +7,7 @@ use std::{
 use openssl::{
     ec::EcKey, encrypt, nid::Nid, pkey::PKey, rsa::{self, Rsa}, symm::{Cipher, Crypter, Mode}
 };
-use rand::prelude::*;
+use rand::{prelude::*, seq};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use thiserror::Error;
 use tokio::net::{lookup_host, UdpSocket};
 use tracing::{debug, info, warn};
 
-use crate::utils::BinaryReader;
+use crate::{charlie_cypher, utils::BinaryReader};
 use crate::utils::BinaryWriter;
 
 use super::constants;
@@ -96,7 +96,7 @@ fn rsa_encrypt(from: &[u8], to: &mut [u8]) -> usize {
     padded_size
 }
 
-pub fn make_record_send_master_handshake(session: &IotcSession) -> std::io::Result<Vec<u8>> {
+fn make_record_send_master_handshake(session: &IotcSession) -> std::io::Result<Vec<u8>> {
     // From iotcRecordSendMasterHandshake in libIOTCAPIs.so.
     let rsa_encrypted_size = 0;
 
@@ -113,8 +113,8 @@ pub fn make_record_send_master_handshake(session: &IotcSession) -> std::io::Resu
 
     let mut payload = vec![0; 0x58];
     let mut payload_cursor = Cursor::new(&mut payload);
-    payload_cursor.write_le_u16(constants::HANDSHAKE_MAGIC_NUMBER)?;
-    payload_cursor.write_u8(0x1d)?;
+    payload_cursor.write_le_u16(constants::PACKET_MAGIC_NUMBER)?;
+    payload_cursor.write_u8(constants::PACKET_VERSION)?;
     payload_cursor.write_u8(0x0)?;
     payload_cursor.write_le_u32(0x48)?;
     payload_cursor.write_le_u16(0x100b)?;
@@ -140,6 +140,7 @@ pub fn make_record_send_master_handshake(session: &IotcSession) -> std::io::Resu
     Ok(packet)
 }
 
+/*
 fn make_record_send_p2p_init_handshake_req(session: &IotcSession) -> std::io::Result<Vec<u8>>
 {
     // From iotcRecordSendP2PInitHandshakeReq in libIOTCAPIs.so.
@@ -148,13 +149,17 @@ fn make_record_send_p2p_init_handshake_req(session: &IotcSession) -> std::io::Re
     let mut packet_cursor = Cursor::new(&mut packet);
     packet_cursor.write_le_u32(constants::RECORD_MAGIC_NUMBER)?;
 
+    Ok(packet)
 }
+*/
 
 fn make_hello_server(session: &IotcSession) -> std::io::Result<Vec<u8>> {
     // From HelloServer in libIOTCAPIs.so.
 
     let content_len = 0x8;
     let packet_flags = 0x2;
+    let channel_id = 0x0;
+    let sequence_number = 0x0;
 
     let mut packet = vec![0; constants::RECORD_PACKET_MAX_SIZE];
     let mut packet_cursor = Cursor::new(&mut packet);
@@ -162,10 +167,23 @@ fn make_hello_server(session: &IotcSession) -> std::io::Result<Vec<u8>> {
     packet_cursor.write_u8(constants::PACKET_VERSION)?;
     packet_cursor.write_u8(packet_flags)?;
     packet_cursor.write_le_u16(content_len)?;
-    packet_cursor.write_le_u16(0x0)?;
+    packet_cursor.write_le_u16(0x0)?; // unknown 
     packet_cursor.write_le_u16(0x8003)?; // cmd
-    packet_cursor.write_le_u16(0x3f)?;
+    packet_cursor.write_le_u32(0x3f)?;
+    packet_cursor.write_u8(channel_id)?;
+    packet_cursor.write_u8(0x0)?;
+    packet_cursor.write_le_u32(sequence_number)?; // TODO: feels like some sequence number that is incremented each time. And randomized at start.
     // TODO: continue.
+    /*
+        local_b7c[0x16] = 0;
+        local_b7c[0x17] = 0;
+        local_b7c[0x14] = (undefined1)DAT_0005c4f4;
+        local_b7c[0x15] = DAT_0005c4f4._1_1_;
+    */
+
+    charlie_cypher(&mut packet);
+
+    Ok(packet)
 }
 
 struct IotcSession {
@@ -385,6 +403,8 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     let session = session_manager.create_session(uid);
 
     let master_domain_name = get_master_domain_name(region);
+
+    debug!("Master domain name: {}", master_domain_name);
 
     {
         // From TUTK3rdECDHCreateKeyPair in libTUTKGlobalAPIs.so:
