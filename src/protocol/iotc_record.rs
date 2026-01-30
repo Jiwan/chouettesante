@@ -1,11 +1,9 @@
 use std::{
-    any,
-    collections::HashMap,
-    io::{Cursor, Read, Seek},
+    any, collections::HashMap, io::{Cursor, Read, Seek}, net::{IpAddr, Ipv4Addr}, os::unix::net::SocketAddr
 };
 
 use openssl::{
-    ec::EcKey, encrypt, nid::Nid, pkey::PKey, rsa::{self, Rsa}, symm::{Cipher, Crypter, Mode}
+    ec::EcKey, encrypt, nid::Nid, pkey::{PKey, Public}, rsa::{self, Rsa}, symm::{Cipher, Crypter, Mode}
 };
 use rand::{prelude::*, seq};
 
@@ -160,8 +158,9 @@ fn make_hello_server(session: &IotcSession) -> std::io::Result<Vec<u8>> {
     let packet_flags = 0x2;
     let channel_id = 0x0;
     let sequence_number = 0x0;
+    let unknown_global = 0x0;
 
-    let mut packet = vec![0; constants::RECORD_PACKET_MAX_SIZE];
+    let mut packet = vec![0; 0x18];
     let mut packet_cursor = Cursor::new(&mut packet);
     packet_cursor.write_le_u16(constants::PACKET_MAGIC_NUMBER)?;
     packet_cursor.write_u8(constants::PACKET_VERSION)?;
@@ -173,15 +172,10 @@ fn make_hello_server(session: &IotcSession) -> std::io::Result<Vec<u8>> {
     packet_cursor.write_u8(channel_id)?;
     packet_cursor.write_u8(0x0)?;
     packet_cursor.write_le_u32(sequence_number)?; // TODO: feels like some sequence number that is incremented each time. And randomized at start.
-    // TODO: continue.
-    /*
-        local_b7c[0x16] = 0;
-        local_b7c[0x17] = 0;
-        local_b7c[0x14] = (undefined1)DAT_0005c4f4;
-        local_b7c[0x15] = DAT_0005c4f4._1_1_;
-    */
+    packet_cursor.write_le_u16(0x0)?;
+    packet_cursor.write_le_u16(unknown_global)?;
 
-    charlie_cypher(&mut packet);
+    charlie_cypher::cypher(&mut packet);
 
     Ok(packet)
 }
@@ -193,6 +187,12 @@ struct IotcSession {
     aes_iv: [u8; 12],
     nonce1: u16,
     nonce2: u16,
+}
+
+#[derive(Debug)]
+struct ServerEntry {
+    ip_address: IpAddr,
+    pub_key: PKey<Public>
 }
 
 impl IotcSession {
@@ -286,7 +286,7 @@ fn parse_record_handshake<T>(
     buffer: &[u8],
     cursor: &mut Cursor<T>,
     session: &IotcSession,
-) -> Result<()>
+) -> Result<Vec<ServerEntry>>
 where
     T: AsRef<[u8]>,
 {
@@ -327,6 +327,8 @@ where
     let entry_count = payload_cursor.read_le_u16()?;
     assert!(entry_count != 0);
 
+    let mut servers = vec![];
+
     for _ in 0..entry_count {
         let entry_type = payload_cursor.read_le_u16()?;
         let entry_size = payload_cursor.read_le_u16()? as u64;
@@ -338,23 +340,21 @@ where
                 let server_count = entry_size / 0x6C;
 
                 for _ in 0..server_count {
-                    let test = payload_cursor.read_le_u16()?;
-                    info!("Server test: {}", test);
                     let _ = payload_cursor.read_le_u16()?;
-                    let ip_address = payload_cursor.read_le_u32()?;
+                    let _ = payload_cursor.read_le_u16()?;
+                    let ip_address: u32 = payload_cursor.read_le_u32()?;
                     let _ = payload_cursor.read_le_u64()?;
                     
                     let mut der_key = [0; 0x5c];
                     payload_cursor.read_exact(&mut der_key)?;
                     let pub_key = PKey::public_key_from_der(& der_key)?;
 
-                    debug!("Server IP: {}.{}.{}.{}, pub_key: {:?}",
-                        ip_address & 0xFF,
-                        (ip_address >> 8) & 0xFF,
-                        (ip_address >> 16) & 0xFF,
-                        (ip_address >> 24) & 0xFF,
-                        pub_key
-                    );
+                    servers.push(ServerEntry{
+                        ip_address: IpAddr::V4(Ipv4Addr::from_bits(ip_address)),
+                        pub_key : pub_key,
+                    });
+
+                    debug!("Server: {:?}", servers.last());
                 }
             }
             1 => {
@@ -371,10 +371,10 @@ where
         payload_cursor.set_position(entry_offset + entry_size);
     }
 
-    Ok(())
+    Ok(servers)
 }
 
-pub fn parse(buffer: &[u8], session: &IotcSession) -> Result<()> {
+pub fn parse(buffer: &[u8], session: &IotcSession) -> Result<Vec<ServerEntry>> {
     // From iotcRecordHandler in libIOTCAPIs.so.
     assert!(buffer.len() >= constants::RECORD_HEADER_SIZE);
     assert!(buffer.len() <= constants::RECORD_PACKET_MAX_SIZE);
@@ -389,11 +389,10 @@ pub fn parse(buffer: &[u8], session: &IotcSession) -> Result<()> {
 
     match record_type {
         RecordType::MasterHandshake => {
-            parse_record_handshake(&buffer, &mut cursor, session)?;
+            parse_record_handshake(&buffer, &mut cursor, session)
         }
-        _ => return Err(anyhow::anyhow!("Invalid record type")),
+        _ => Err(anyhow::anyhow!("Invalid record type"))
     }
-    Ok(())
 }
 
 pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
@@ -433,7 +432,14 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     println!("Received response: {:?} {}", buf, buf.len());
 
-    parse(&buf, &session)?;
+    let server_entries = parse(&buf, &session)?;
+
+    let packet = make_hello_server(&session)?;
+
+    for server_entry in server_entries {
+        let target = SocketAddr::from((server_entry.ip_address, 10001));
+        socket.send_to(&packet, target);
+    }
 
     Ok(())
 }
