@@ -21,5 +21,5 @@ pub unsafe extern "C" fn charlie_decypher(data: *mut u8, len: usize) {
     }
 
     let slice = unsafe { slice::from_raw_parts_mut(data, len) };
-    let _ = protocol::parser::parse(slice);
+    let _ = protocol::iotc_record::parse(slice, None);
 }

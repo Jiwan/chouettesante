@@ -1,23 +1,54 @@
 use std::{
-    any, collections::HashMap, io::{Cursor, Read, Seek}, net::{IpAddr, Ipv4Addr, SocketAddr}
+    collections::HashMap, io::{Cursor, Read, Seek}, net::{IpAddr, Ipv4Addr, SocketAddr}
 };
 
 use openssl::{
-    ec::EcKey, encrypt, nid::Nid, pkey::{PKey, Public}, rsa::{self, Rsa}, symm::{Cipher, Crypter, Mode}
+    ec::EcKey, nid::Nid, pkey::{PKey, Public}, rsa::{self, Rsa}, symm::{Cipher, Crypter, Mode}
 };
-use rand::{prelude::*, seq};
+use rand::prelude::*;
 
 use anyhow::{Context, Result};
+use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use thiserror::Error;
 use tokio::net::{lookup_host, UdpSocket};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
-use crate::{charlie_cypher, utils::BinaryReader};
+use crate::{charlie_cypher, charlie_cypher::decypher, utils::BinaryReader};
 use crate::utils::BinaryWriter;
 
 use super::constants;
+
+const PACKET_HEADER_SIZE: usize = 0x10;
+
+#[derive(Error, Debug)]
+enum ParseError {
+    #[error("InvalidHeaderSize")]
+    InvalidHeaderSize,
+    #[error("WrongPacketMagicNumber")]
+    WrongPacketMagicNumber,
+    #[error("WrongVersion")]
+    WrongVersion,
+    #[error("InvalidCypheredContentSize")]
+    InvalidCypheredContentSize,
+    #[error("WrongFlagType")]
+    WrongFlagType,
+    #[error("InvalidSessionId")]
+    InvalidSessionId,
+    #[error("InvalidChannelId")]
+    InvalidChannelId,
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct PacketFlags: u8 {
+        const CypherExtendHeaderOnly = 0b0001;
+        const UnknownFlag0x2 = 0b0100;
+        const UnknownFlag0x4 = 0b0100;
+        const UnknownFlag0x8 = 0b1000;
+    }
+}
 
 #[repr(u8)]
 enum RecordType {
@@ -254,6 +285,97 @@ enum DecryptError {
     AuthenticationFailed,
 }
 
+pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
+    let (header, content) = buffer
+        .split_at_mut_checked(PACKET_HEADER_SIZE)
+        .context(ParseError::InvalidHeaderSize)?;
+
+    decypher(header);
+
+    let mut reader = Cursor::new(header);
+    let magic_number = reader.read_le_u16()?;
+
+    if magic_number != constants::PACKET_MAGIC_NUMBER {
+        return Err(ParseError::WrongPacketMagicNumber.into());
+    }
+
+    let version = reader.read_u8()?;
+
+    if version != constants::PACKET_VERSION {
+        return Err(ParseError::WrongVersion.into());
+    }
+
+    let packet_flags = PacketFlags::from_bits_retain(reader.read_u8()?);
+    let packet_size = reader.read_le_u16()?;
+    let _unknown0x6 = reader.read_le_u16()?; // unknown
+
+    let cmd_type = reader.read_le_u16()?;
+    let _ = reader.read_le_u32()?; // unknown
+    let channelId = reader.read_u8()?;
+    let _unknow0x15 = reader.read_u8()?; // unknown
+
+    // From FUN_0004a770 in libIOTCAPIs.so
+    let cyphered_size = if packet_flags.contains(PacketFlags::CypherExtendHeaderOnly) {
+        0x30
+    } else {
+        packet_size as usize
+    };
+
+    if cyphered_size > content.len() {
+        return Err(ParseError::InvalidCypheredContentSize.into());
+    }
+
+    decypher(&mut content[..cyphered_size]);
+
+    // From: _IOTC_Packet_Handler in libIOTCAPIs.so
+    match cmd_type {
+        0x408 => {
+            if packet_flags.contains(PacketFlags::UnknownFlag0x4) {
+                return Err(ParseError::InvalidCypheredContentSize.into());
+            }
+
+            if content.len() < 0x0c {
+                return Err(ParseError::InvalidCypheredContentSize.into());
+            }
+
+            if !packet_flags.contains(PacketFlags::UnknownFlag0x8) {
+                // TODO
+            } else {
+                let mut reader: Cursor<&mut [u8]> = Cursor::new(content);
+                let extended_header_size = reader.read_le_u32()? as usize;
+                let session1 = reader.read_le_u32()?; // unknown
+                let session2 = reader.read_le_u32()?; // unknown
+
+                if session1 == 0 {
+                    return Err(ParseError::InvalidSessionId.into());
+                }
+
+                // Search for session1 and session2 in gSessionInfo to extract the right session.
+
+                if channelId >= 0x20 {
+                    return Err(ParseError::InvalidChannelId.into());
+                }
+
+                let content = &content[extended_header_size..];
+
+                let mut reader = Cursor::new(content);
+                let _ = reader.read_u8()?; // unknown
+                let _ = reader.read_u8()?; // unknown
+                let _ = reader.read_le_u16()?; // unknown
+
+                // content == DTLS 1.2 packet
+                // As a stream: https://docs.rs/ringbuf/latest/ringbuf/
+                // Supplied to a SslStream: https://docs.rs/openssl/0.10.71/openssl/ssl/index.html
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+
+
 fn decrypt_aes_128_gcm(
     ciphertext: &[u8],
     aad: &[u8],
@@ -376,24 +498,39 @@ where
     Ok(servers)
 }
 
-pub fn parse(buffer: &[u8], session: &IotcSession) -> Result<Vec<ServerEntry>> {
-    // From iotcRecordHandler in libIOTCAPIs.so.
-    assert!(buffer.len() >= constants::RECORD_HEADER_SIZE);
-    assert!(buffer.len() <= constants::RECORD_PACKET_MAX_SIZE);
+pub fn parse(buffer: &mut [u8], session: Option<&IotcSession>) -> Result<Option<Vec<ServerEntry>>> {
+    // From iotcRecordHandler in libIOTCAPIs.so / handle_buffer
+    let mut buf = Cursor::new(&*buffer);
+    let record_magic_number = buf.read_le_u32()?;
 
-    let mut cursor = Cursor::new(buffer);
-    let record_magic_number = cursor.read_le_u32()?;
+    match record_magic_number {
+        constants::RECORD_MAGIC_NUMBER => {
+            // Process as record
+            if let Some(session) = session {
+                assert!(buffer.len() >= constants::RECORD_HEADER_SIZE);
+                assert!(buffer.len() <= constants::RECORD_PACKET_MAX_SIZE);
 
-    assert!(record_magic_number == constants::RECORD_MAGIC_NUMBER);
+                let mut cursor = Cursor::new(&*buffer);
+                let _ = cursor.read_le_u32()?; // magic number already read
 
-    let _ = cursor.read_u8()?;
-    let record_type: RecordType = cursor.read_u8()?.try_into()?;
+                let _ = cursor.read_u8()?;
+                let record_type: RecordType = cursor.read_u8()?.try_into()?;
 
-    match record_type {
-        RecordType::MasterHandshake => {
-            parse_record_handshake(&buffer, &mut cursor, session)
+                match record_type {
+                    RecordType::MasterHandshake => {
+                        parse_record_handshake(&buffer, &mut cursor, session).map(Some)
+                    }
+                    _ => Err(anyhow::anyhow!("Invalid record type"))
+                }
+            } else {
+                Ok(None)
+            }
         }
-        _ => Err(anyhow::anyhow!("Invalid record type"))
+        _ => {
+            // Process as packet
+            parse_packet(buffer)?;
+            Ok(None)
+        }
     }
 }
 
@@ -410,7 +547,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     {
         // From TUTK3rdECDHCreateKeyPair in libTUTKGlobalAPIs.so:
         // We might need to use: https://docs.rs/openssl/latest/openssl/ec/struct.EcKey.html#method.generate
-        let curve = EcKey::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let _curve = EcKey::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
     }
 
     let send_addr = lookup_host((master_domain_name.as_str(), 10240))
@@ -427,14 +564,14 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     socket.send_to(&record, send_addr).await?;
 
     let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
-    let (usize, recv_addr) = socket.recv_from(&mut buf).await?;
+    let (usize, _recv_addr) = socket.recv_from(&mut buf).await?;
     buf.truncate(usize);
 
-    assert!(send_addr == recv_addr);
+    assert!(send_addr == _recv_addr);
 
     debug!("Received response: {:?} {}", buf, buf.len());
 
-    let server_entries = parse(&buf, &session)?;
+    let server_entries = parse(&mut buf, Some(&session))?.ok_or_else(|| anyhow::anyhow!("Expected record response"))?;
 
     let packet = make_hello_server(&session)?;
 
@@ -446,8 +583,12 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     debug!("Sent hello server packet to all candidates");
 
     let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
-    let (usize, recv_addr) = socket.recv_from(&mut buf).await?;
+    let (usize, _recv_addr) = socket.recv_from(&mut buf).await?;
     buf.truncate(usize);
+
+    parse(&mut buf, None)?;
+
+    crate::utils::hexdump(&buf);
 
     println!("Received response: {:?} {}", buf, buf.len());
 
