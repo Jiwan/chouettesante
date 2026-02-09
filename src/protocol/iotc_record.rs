@@ -1,5 +1,5 @@
 use std::{
-    any, collections::HashMap, io::{Cursor, Read, Seek}, net::{IpAddr, Ipv4Addr}, os::unix::net::SocketAddr
+    any, collections::HashMap, io::{Cursor, Read, Seek}, net::{IpAddr, Ipv4Addr, SocketAddr}
 };
 
 use openssl::{
@@ -158,7 +158,7 @@ fn make_hello_server(session: &IotcSession) -> std::io::Result<Vec<u8>> {
     let packet_flags = 0x2;
     let channel_id = 0x0;
     let sequence_number = 0x0;
-    let unknown_global = 0x0;
+    let random_nonce = 0xbcda;
 
     let mut packet = vec![0; 0x18];
     let mut packet_cursor = Cursor::new(&mut packet);
@@ -172,8 +172,8 @@ fn make_hello_server(session: &IotcSession) -> std::io::Result<Vec<u8>> {
     packet_cursor.write_u8(channel_id)?;
     packet_cursor.write_u8(0x0)?;
     packet_cursor.write_le_u32(sequence_number)?; // TODO: feels like some sequence number that is incremented each time. And randomized at start.
+    packet_cursor.write_le_u16(random_nonce)?;
     packet_cursor.write_le_u16(0x0)?;
-    packet_cursor.write_le_u16(unknown_global)?;
 
     charlie_cypher::cypher(&mut packet);
 
@@ -192,6 +192,7 @@ struct IotcSession {
 #[derive(Debug)]
 struct ServerEntry {
     ip_address: IpAddr,
+    port: u16,
     pub_key: PKey<Public>
 }
 
@@ -341,8 +342,8 @@ where
 
                 for _ in 0..server_count {
                     let _ = payload_cursor.read_le_u16()?;
-                    let _ = payload_cursor.read_le_u16()?;
-                    let ip_address: u32 = payload_cursor.read_le_u32()?;
+                    let port = payload_cursor.read_be_u16()?;
+                    let ip_address: u32 = payload_cursor.read_be_u32()?;
                     let _ = payload_cursor.read_le_u64()?;
                     
                     let mut der_key = [0; 0x5c];
@@ -351,7 +352,8 @@ where
 
                     servers.push(ServerEntry{
                         ip_address: IpAddr::V4(Ipv4Addr::from_bits(ip_address)),
-                        pub_key : pub_key,
+                        port,
+                        pub_key,
                     });
 
                     debug!("Server: {:?}", servers.last());
@@ -430,16 +432,24 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     assert!(send_addr == recv_addr);
 
-    println!("Received response: {:?} {}", buf, buf.len());
+    debug!("Received response: {:?} {}", buf, buf.len());
 
     let server_entries = parse(&buf, &session)?;
 
     let packet = make_hello_server(&session)?;
 
     for server_entry in server_entries {
-        let target = SocketAddr::from((server_entry.ip_address, 10001));
-        socket.send_to(&packet, target);
+        let target = SocketAddr::from((server_entry.ip_address, server_entry.port));
+        socket.send_to(&packet, target).await?;
     }
+
+    debug!("Sent hello server packet to all candidates");
+
+    let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
+    let (usize, recv_addr) = socket.recv_from(&mut buf).await?;
+    buf.truncate(usize);
+
+    println!("Received response: {:?} {}", buf, buf.len());
 
     Ok(())
 }
