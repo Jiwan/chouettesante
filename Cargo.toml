@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+num_enum = "=0.7.5"
 rand = "0.9"
 anyhow = "1.0.95"
 thiserror = "2.0.11"

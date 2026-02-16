@@ -1,22 +1,31 @@
 use std::{
-    collections::HashMap, io::{Cursor, Read, Seek}, net::{IpAddr, Ipv4Addr, SocketAddr}
+    collections::HashMap,
+    io::{Cursor, Read, Seek, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
 use openssl::{
-    ec::EcKey, nid::Nid, pkey::{PKey, Public}, rsa::{self, Rsa}, symm::{Cipher, Crypter, Mode}
+    ec::{EcGroup, EcKey},
+    nid::Nid,
+    pkey::{PKey, Public},
+    rsa::{self, Rsa},
+    symm::{Cipher, Crypter, Mode},
+    dh::DhRef
 };
 use rand::prelude::*;
 
 use anyhow::{Context, Result};
 use bitflags::bitflags;
-use serde::{Deserialize, Serialize};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+use serde::{de, Deserialize, Serialize};
 use serde_json;
 use thiserror::Error;
-use tokio::net::{lookup_host, UdpSocket};
+use tokio::{net::{UdpSocket, lookup_host}};
 use tracing::{debug, warn};
+use tracing_subscriber::field::debug;
 
-use crate::{charlie_cypher, charlie_cypher::decypher, utils::BinaryReader};
 use crate::utils::BinaryWriter;
+use crate::{charlie_cypher, charlie_cypher::decypher, utils::BinaryReader};
 
 use super::constants;
 
@@ -53,7 +62,7 @@ bitflags! {
 #[repr(u8)]
 enum RecordType {
     MasterHandshake = 0x1,
-    P2PHandshake = 0x2,
+    P2PInitHandshakeReq = 0x2,
 }
 
 #[derive(Error, Debug)]
@@ -71,6 +80,16 @@ impl TryFrom<u8> for RecordType {
             _ => Err(RecordConversionError::InvalidRecordType),
         }
     }
+}
+
+#[repr(u16)]
+#[derive(Debug, PartialEq, IntoPrimitive, TryFromPrimitive)]
+enum CmdType {
+    UnknownCmd0x408 = 0x408,
+    P2PInitHandshakeReq = 0x100b,
+    P2PInitHandshakeResp = 0x100c,
+    HelloServer = 0x8003,
+    HelloClient = 0x8004,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -169,18 +188,78 @@ fn make_record_send_master_handshake(session: &IotcSession) -> std::io::Result<V
     Ok(packet)
 }
 
-/*
-fn make_record_send_p2p_init_handshake_req(session: &IotcSession) -> std::io::Result<Vec<u8>>
+
+fn derive_aes_128_key(private_key: &EcKey<openssl::pkey::Private>, public_key: &PKey<Public>) -> Result<[u8; 16]> {
+    // create AES key from ECDH shared secret (ECDH_compute_key equivalent)
+    use openssl::pkey::PKey;
+    use openssl::derive::Deriver;
+    let my_pkey = PKey::from_ec_key(private_key.clone())?;
+    let mut deriver = Deriver::new(&my_pkey)?;
+    deriver.set_peer(&public_key)?;
+    let shared_secret = deriver.derive_to_vec()?;
+    let aes_key = &shared_secret[0..16];
+    Ok(aes_key.try_into().unwrap())
+}
+
+fn encrypt_aes_128_gcm(
+    plaintext: &[u8],
+    aad: &[u8],
+    aes_key: [u8; 16],
+    aes_iv: [u8; 12],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    // From TUTK3rdAESEncryptEx in libTUTKGlobalAPIs.so.
+    // https://wiki.openssl.org/index.php/EVP_Authenticated_Encryption_and_Decryption
+
+    let cipher = Cipher::aes_128_gcm();
+    let mut crypter = Crypter::new(cipher, Mode::Encrypt, &aes_key, Some(&aes_iv))?;
+
+    crypter.aad_update(aad)?;
+
+    let mut ciphertext = vec![0; plaintext.len() + cipher.block_size()];
+    let mut count = crypter.update(plaintext, &mut ciphertext)?;
+
+    count += crypter.finalize(&mut ciphertext[count..])?;
+    ciphertext.truncate(count);
+
+    let mut tag = vec![0; 16];
+    crypter.get_tag(&mut tag)?;
+
+    Ok((ciphertext, tag))
+}
+
+fn make_record_send_p2p_init_handshake_req(session: &IotcSession, server_entry: &ServerEntry) -> Result<Vec<u8>>
 {
     // From iotcRecordSendP2PInitHandshakeReq in libIOTCAPIs.so.
+    let rsa_encrypted_size = 0;
 
     let mut packet = vec![0; constants::RECORD_PACKET_MAX_SIZE];
     let mut packet_cursor = Cursor::new(&mut packet);
     packet_cursor.write_le_u32(constants::RECORD_MAGIC_NUMBER)?;
+    packet_cursor.write_u8(1)?;
+    packet_cursor.write_u8(RecordType::P2PInitHandshakeReq as u8)?;
+    let rsa_encrypted_size_offset = packet_cursor.position();
+    packet_cursor.write_le_u16(rsa_encrypted_size)?;
+    packet_cursor.write_le_u32(session.session_id)?;
 
-    Ok(packet)
+    let der = session.ecdh_key.public_key_to_der()?;
+    assert!(der.len() == 0x5b);
+
+    packet_cursor.write(&session.aes_iv)?;
+    packet_cursor.write(&der)?;
+    packet_cursor.write_u8(0x0)?;
+    assert!(packet_cursor.position() == 0x74);
+
+    let aes_key = derive_aes_128_key(&session.ecdh_key, &server_entry.pub_key)?;
+
+   let (ciphertext, tag) = encrypt_aes_128_gcm(&[], &packet[..0x74], aes_key.try_into().unwrap(), session.aes_iv)?;
+
+
+
+   packet_cursor.write(&ciphertext)?;
+   packet_cursor.write(&tag)?;
+
+   Ok(packet)
 }
-*/
 
 fn make_hello_server(session: &IotcSession) -> std::io::Result<Vec<u8>> {
     // From HelloServer in libIOTCAPIs.so.
@@ -197,8 +276,8 @@ fn make_hello_server(session: &IotcSession) -> std::io::Result<Vec<u8>> {
     packet_cursor.write_u8(constants::PACKET_VERSION)?;
     packet_cursor.write_u8(packet_flags)?;
     packet_cursor.write_le_u16(content_len)?;
-    packet_cursor.write_le_u16(0x0)?; // unknown 
-    packet_cursor.write_le_u16(0x8003)?; // cmd
+    packet_cursor.write_le_u16(0x0)?;
+    packet_cursor.write_le_u16(CmdType::HelloServer as u16)?;
     packet_cursor.write_le_u32(0x3f)?;
     packet_cursor.write_u8(channel_id)?;
     packet_cursor.write_u8(0x0)?;
@@ -211,20 +290,29 @@ fn make_hello_server(session: &IotcSession) -> std::io::Result<Vec<u8>> {
     Ok(packet)
 }
 
-struct IotcSession {
+pub struct IotcSession {
     session_id: u32,
     device_id: [u8; 20],
     aes_key: [u8; 16],
     aes_iv: [u8; 12],
     nonce1: u16,
     nonce2: u16,
+    ecdh_key: EcKey<openssl::pkey::Private>,
 }
 
 #[derive(Debug)]
-struct ServerEntry {
+pub struct ServerEntry {
     ip_address: IpAddr,
     port: u16,
-    pub_key: PKey<Public>
+    pub_key: PKey<Public>,
+}
+
+fn generate_ecdh_key() -> Result<EcKey<openssl::pkey::Private>> {
+    // From TUTK3rdECDHCreateKeyPair in libTUTKGlobalAPIs.so:
+    let nid = Nid::X9_62_PRIME256V1; // NIST P-256 curve
+    let group = EcGroup::from_curve_name(nid)?;
+    let key = EcKey::generate(&group)?;
+    Ok(key)
 }
 
 impl IotcSession {
@@ -246,6 +334,7 @@ impl IotcSession {
             aes_iv,
             nonce1,
             nonce2,
+            ecdh_key: generate_ecdh_key()?,
         })
     }
 }
@@ -328,8 +417,17 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
     decypher(&mut content[..cyphered_size]);
 
     // From: _IOTC_Packet_Handler in libIOTCAPIs.so
-    match cmd_type {
-        0x408 => {
+    let cmd_type_enum = CmdType::try_from(cmd_type);
+
+    if cmd_type_enum.is_err() {
+        warn!("Unknown cmd type: 0x{:04x}", cmd_type);
+        return Ok(());
+    }
+
+    let mut reader: Cursor<&[u8]> = Cursor::new(content);
+
+    match cmd_type_enum.unwrap() {
+        CmdType::UnknownCmd0x408 => {
             if packet_flags.contains(PacketFlags::UnknownFlag0x4) {
                 return Err(ParseError::InvalidCypheredContentSize.into());
             }
@@ -341,7 +439,6 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
             if !packet_flags.contains(PacketFlags::UnknownFlag0x8) {
                 // TODO
             } else {
-                let mut reader: Cursor<&mut [u8]> = Cursor::new(content);
                 let extended_header_size = reader.read_le_u32()? as usize;
                 let session1 = reader.read_le_u32()?; // unknown
                 let session2 = reader.read_le_u32()?; // unknown
@@ -368,13 +465,28 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
                 // Supplied to a SslStream: https://docs.rs/openssl/0.10.71/openssl/ssl/index.html
             }
         }
-        _ => {}
+        CmdType::P2PInitHandshakeReq | CmdType::P2PInitHandshakeResp => {
+            debug!("Received P2P handshake packet");
+        }
+        CmdType::HelloServer => {
+            debug!("Received HelloServer packet");
+        }
+        CmdType::HelloClient => {
+            // addNatRecord in libIOTCAPIs.so
+            {
+                let _ = reader.read_le_u16()?; // Probably the af type?
+                let our_port = reader.read_be_u16()?;
+                let our_address: u32 = reader.read_be_u32()?;
+                let our_address = IpAddr::V4(Ipv4Addr::from_bits(our_address));
+                let _ = reader.read_le_u64()?; // unknown
+                
+                debug!("Client IP address: {}:{}", our_address, our_port);
+            }
+        }
     }
 
     Ok(())
 }
-
-
 
 fn decrypt_aes_128_gcm(
     ciphertext: &[u8],
@@ -467,12 +579,12 @@ where
                     let port = payload_cursor.read_be_u16()?;
                     let ip_address: u32 = payload_cursor.read_be_u32()?;
                     let _ = payload_cursor.read_le_u64()?;
-                    
+
                     let mut der_key = [0; 0x5c];
                     payload_cursor.read_exact(&mut der_key)?;
-                    let pub_key = PKey::public_key_from_der(& der_key)?;
+                    let pub_key = PKey::public_key_from_der(&der_key)?;
 
-                    servers.push(ServerEntry{
+                    servers.push(ServerEntry {
                         ip_address: IpAddr::V4(Ipv4Addr::from_bits(ip_address)),
                         port,
                         pub_key,
@@ -520,7 +632,7 @@ pub fn parse(buffer: &mut [u8], session: Option<&IotcSession>) -> Result<Option<
                     RecordType::MasterHandshake => {
                         parse_record_handshake(&buffer, &mut cursor, session).map(Some)
                     }
-                    _ => Err(anyhow::anyhow!("Invalid record type"))
+                    _ => Err(anyhow::anyhow!("Invalid record type")),
                 }
             } else {
                 Ok(None)
@@ -544,12 +656,6 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     debug!("Master domain name: {}", master_domain_name);
 
-    {
-        // From TUTK3rdECDHCreateKeyPair in libTUTKGlobalAPIs.so:
-        // We might need to use: https://docs.rs/openssl/latest/openssl/ec/struct.EcKey.html#method.generate
-        let _curve = EcKey::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-    }
-
     let send_addr = lookup_host((master_domain_name.as_str(), 10240))
         .await?
         .next()
@@ -563,6 +669,8 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.send_to(&record, send_addr).await?;
 
+    debug!("Socket port after bind: {}", socket.local_addr()?.port());
+
     let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
     let (usize, _recv_addr) = socket.recv_from(&mut buf).await?;
     buf.truncate(usize);
@@ -571,11 +679,12 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     debug!("Received response: {:?} {}", buf, buf.len());
 
-    let server_entries = parse(&mut buf, Some(&session))?.ok_or_else(|| anyhow::anyhow!("Expected record response"))?;
+    let server_entries = parse(&mut buf, Some(&session))?
+        .ok_or_else(|| anyhow::anyhow!("Expected record response"))?;
 
     let packet = make_hello_server(&session)?;
 
-    for server_entry in server_entries {
+    for server_entry in &server_entries {
         let target = SocketAddr::from((server_entry.ip_address, server_entry.port));
         socket.send_to(&packet, target).await?;
     }
@@ -591,6 +700,8 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     crate::utils::hexdump(&buf);
 
     println!("Received response: {:?} {}", buf, buf.len());
+
+    make_record_send_p2p_init_handshake_req(&session, &server_entries[0])?;
 
     Ok(())
 }
