@@ -2,6 +2,7 @@ pub const RECORD_MAGIC_NUMBER: u32 = 0xcc51;
 pub const RECORD_PACKET_MAX_SIZE: usize = 0x588;
 pub const RECORD_HEADER_SIZE: usize = 0xc;
 pub const RECORD_AES_TAG_SIZE: usize = 0x10;
+pub const PACKET_HEADER_SIZE: usize = 0x10;
 pub const PACKET_MAGIC_NUMBER: u16 = 0x204;
 pub const PACKET_VERSION: u8 = 0x1e;
 
