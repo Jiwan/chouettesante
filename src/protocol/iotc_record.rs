@@ -262,7 +262,10 @@ where
     let record_header_size_position = record_writer.position();
     record_writer.write_le_u16(0)?;
     record_writer.write_le_u32(session_id)?;
-    assert_eq!(record_writer.position() as usize, constants::RECORD_HEADER_SIZE);
+    assert_eq!(
+        record_writer.position() as usize,
+        constants::RECORD_HEADER_SIZE
+    );
 
     write_extended_header(&mut record_writer)?;
     let header_size = record_writer.position() as usize;
@@ -278,9 +281,8 @@ where
 
     assert_eq!(payload_size, expected_payload_size);
 
-    let record_size = header_size - constants::RECORD_HEADER_SIZE
-        + payload_size
-        + constants::RECORD_AES_TAG_SIZE;
+    let record_size =
+        header_size - constants::RECORD_HEADER_SIZE + payload_size + constants::RECORD_AES_TAG_SIZE;
     assert_eq!(record_size, expected_record_size);
     let expected_total_size = constants::RECORD_HEADER_SIZE + expected_record_size;
     assert!(expected_total_size <= constants::RECORD_PACKET_MAX_SIZE);
@@ -298,22 +300,14 @@ where
         record_writer.set_position(current_position);
     }
 
-    let (ciphertext, tag) = encrypt_aes_128_gcm(
-        &payload,
-        &record[..header_size],
-        aes_key,
-        aes_iv,
-    )?;
+    let aad = &record_writer.get_ref()[..header_size];
+    let (ciphertext, tag) = encrypt_aes_128_gcm(&payload, aad, aes_key, aes_iv)?;
     assert_eq!(ciphertext.len(), expected_payload_size);
     assert_eq!(tag.len(), constants::RECORD_AES_TAG_SIZE);
 
-    let final_size = {
-        let mut record_writer = Cursor::new(record.as_mut_slice());
-        record_writer.set_position(header_size as u64);
-        record_writer.write_bytes(&ciphertext)?;
-        record_writer.write_bytes(&tag)?;
-        record_writer.position() as usize
-    };
+    record_writer.write_bytes(&ciphertext)?;
+    record_writer.write_bytes(&tag)?;
+    let final_size = record_writer.position() as usize;
     assert_eq!(final_size, expected_total_size);
 
     record.truncate(final_size);
@@ -358,8 +352,6 @@ fn make_record_send_p2p_init_handshake_req(
     const RECORD_SIZE: usize = 0xac;
     const EXPECTED_PACKET_SIZE: usize = 0x34;
 
-    let der = session.ecdh_key.public_key_to_der()?;
-    assert_eq!(der.len(), 0x5b, "ECDH DER key must be exactly 0x5B bytes");
     let aes_key = derive_aes_128_key(&session.ecdh_key, &server_entry.pub_key)?;
 
     make_record(
@@ -370,6 +362,10 @@ fn make_record_send_p2p_init_handshake_req(
         aes_key,
         session.aes_iv,
         move |writer| {
+            
+            let der = session.ecdh_key.public_key_to_der()?;
+            assert_eq!(der.len(), 0x5b, "ECDH DER key must be exactly 0x5B bytes");
+
             writer.write_bytes(&session.aes_iv)?;
             writer.write_bytes(&der)?;
             writer.write_u8(0)?;
@@ -810,7 +806,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     debug!("Sent hello server packet to all candidates");
 
     let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
-    let (usize, _recv_addr) = socket.recv_from(&mut buf).await?;
+    let (usize, recv_addr) = socket.recv_from(&mut buf).await?;
     buf.truncate(usize);
 
     parse(&mut buf, None)?;
@@ -820,6 +816,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     println!("Received response: {:?} {}", buf, buf.len());
 
     let p2p_init_record = make_record_send_p2p_init_handshake_req(&session, &server_entries[0])?;
+    socket.send_to(&p2p_init_record, recv_addr).await?;
 
     Ok(())
 }
