@@ -149,7 +149,9 @@ struct PacketHeader {
     command: u16,
     channel_id: u8,
     flags: u8,
-    unknown_0xa: u32,
+    command_options: u16, // Speculative field.
+    session_id: u16, // Speculative field.
+    channel_flags: u8, // Speculative field.
 }
 
 fn write_packet<WriteContent>(
@@ -170,9 +172,10 @@ where
     packet_writer.write_le_u16(0)?;
     packet_writer.write_le_u16(0)?;
     packet_writer.write_le_u16(header.command)?;
-    packet_writer.write_le_u32(header.unknown_0xa)?;
+    packet_writer.write_le_u16(header.command_options)?;
+    packet_writer.write_le_u16(header.session_id)?;
     packet_writer.write_u8(header.channel_id)?;
-    packet_writer.write_u8(0)?;
+    packet_writer.write_u8(header.channel_flags)?;
 
     let content_start = packet_writer.position();
     write_content(packet_writer)?;
@@ -216,7 +219,9 @@ fn make_record_send_master_handshake(session: &IotcSession) -> Result<Vec<u8>> {
             command: CmdType::P2PInitHandshakeReq as u16,
             channel_id: 0,
             flags: 0,
-            unknown_0xa: 0x18,
+            command_options: 0x18,
+            session_id: 0,
+            channel_flags: 0,
         },
         |writer| {
             writer.write_le_u16(session.nonce1)?;
@@ -370,7 +375,9 @@ fn make_p2p_init_packet(packet_writer: &mut Cursor<&mut [u8]>) -> Result<()> {
             command: CmdType::P2PInit as u16,
             channel_id: 0,
             flags: 0,
-            unknown_0xa: 0x24,
+            command_options: 0x24,
+            session_id: 0,
+            channel_flags: 0,
         },
         |writer| {
             writer.write_le_u16(0)?;
@@ -431,7 +438,9 @@ fn make_hello_server(session: &IotcSession) -> Result<Vec<u8>> {
             command: CmdType::HelloServer as u16,
             channel_id: 0,
             flags: 0x2,
-            unknown_0xa: 0x3f,
+            command_options: 0x3f,
+            session_id: 0,
+            channel_flags: 0,
         },
         |writer| {
             writer.write_le_u32(sequence_number)?; // TODO: feels like some sequence number that is incremented each time. And randomized at start.
@@ -556,9 +565,10 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
     let _unknown0x6 = reader.read_le_u16()?; // unknown
 
     let cmd_type = reader.read_le_u16()?;
-    let _ = reader.read_le_u32()?; // unknown
+    let _command_options = reader.read_le_u16()?; // TODO: Confirm this field's meaning.
+    let _session_id = reader.read_le_u16()?; // TODO: Confirm this field's meaning.
     let channelId = reader.read_u8()?;
-    let _unknow0x15 = reader.read_u8()?; // unknown
+    let _channel_flags = reader.read_u8()?; // TODO: Confirm this field's meaning.
 
     // From FUN_0004a770 in libIOTCAPIs.so
     let cyphered_size = if packet_flags.contains(PacketFlags::CypherExtendHeaderOnly) {
@@ -882,7 +892,9 @@ mod packet_writer_tests {
                 command: 0x1234,
                 channel_id: 0x56,
                 flags: 0x78,
-                unknown_0xa: 0x9abcdef0,
+                command_options: 0xdef0,
+                session_id: 0x9abc,
+                channel_flags: 0x12,
             },
             |writer| {
                 writer.write_bytes(&[0xaa, 0xbb, 0xcc])?;
@@ -910,7 +922,7 @@ mod packet_writer_tests {
             &[0xf0, 0xde, 0xbc, 0x9a]
         );
         assert_eq!(buffer[PACKET_START + 14], 0x56);
-        assert_eq!(buffer[PACKET_START + 15], 0);
+        assert_eq!(buffer[PACKET_START + 15], 0x12);
         assert_eq!(
             &buffer[PACKET_START + constants::PACKET_HEADER_SIZE
                 ..PACKET_START + constants::PACKET_HEADER_SIZE + 3],
@@ -930,7 +942,9 @@ mod packet_writer_tests {
                 command: 0,
                 channel_id: 0,
                 flags: 0,
-                unknown_0xa: 0,
+                command_options: 0,
+                session_id: 0,
+                channel_flags: 0,
             },
             |writer| {
                 writer.write_u8(0)?;
