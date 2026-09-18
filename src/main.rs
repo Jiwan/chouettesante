@@ -7,11 +7,10 @@ use tracing_subscriber;
 mod authentication;
 
 mod charlie_cypher;
-mod utils;
 mod protocol;
+mod utils;
 
-use protocol::iotc_record
-::{connect, MasterRegion};
+use protocol::iotc::{connect, MasterRegion};
 
 #[derive(Deserialize)]
 pub struct Credentials {

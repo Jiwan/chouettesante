@@ -27,7 +27,7 @@ use super::{
     constants,
     crypto::{
         decrypt_aes_128_gcm, derive_aes_128_key, encrypt_aes_128_gcm, generate_ecdh_key,
-        rsa_encrypt,
+        rsa_encrypt, rsa_encrypted_size,
     },
 };
 
@@ -65,6 +65,33 @@ bitflags! {
 enum RecordType {
     MasterHandshake = 0x1,
     P2PInitHandshakeReq = 0x2,
+}
+
+enum RecordEncryption {
+    Rsa,
+    Aes128Gcm { key: [u8; 16], iv: [u8; 12] },
+}
+
+impl RecordEncryption {
+    fn encrypted_size(&self, plaintext_size: usize) -> usize {
+        match self {
+            Self::Rsa => rsa_encrypted_size(plaintext_size),
+            Self::Aes128Gcm { .. } => plaintext_size + constants::RECORD_AES_TAG_SIZE,
+        }
+    }
+
+    fn encrypt(self, plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+        match self {
+            Self::Rsa => {
+                let expected_size = rsa_encrypted_size(plaintext.len());
+                let mut ciphertext = vec![0; expected_size];
+                let encrypted_size = rsa_encrypt(plaintext, &mut ciphertext);
+                assert_eq!(encrypted_size, expected_size);
+                Ok((ciphertext, Vec::new()))
+            }
+            Self::Aes128Gcm { key, iv } => encrypt_aes_128_gcm(plaintext, aad, key, iv),
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -176,56 +203,44 @@ where
 
 fn make_record_send_master_handshake(session: &IotcSession) -> Result<Vec<u8>> {
     // From iotcRecordSendMasterHandshake in libIOTCAPIs.so.
+    const RECORD_SIZE: usize = 0x100;
+    const EXPECTED_PACKET_SIZE: usize = 0x58;
     const EXPECTED_CONTENT_SIZE: usize = 0x48;
 
-    let rsa_encrypted_size = 0;
-
-    let mut packet = vec![0; constants::RECORD_PACKET_MAX_SIZE];
-    let mut packet_cursor = Cursor::new(&mut packet);
-    packet_cursor.write_le_u32(constants::RECORD_MAGIC_NUMBER)?;
-    packet_cursor.write_u8(1)?;
-    packet_cursor.write_u8(RecordType::MasterHandshake as u8)?;
-    let rsa_encrypted_size_offset = packet_cursor.position();
-    packet_cursor.write_le_u16(rsa_encrypted_size)?;
-    packet_cursor.write_le_u32(session.session_id)?;
-
-    assert!(packet_cursor.position() as usize == constants::RECORD_HEADER_SIZE);
-
-    let mut payload = vec![0; 0x58];
-    let mut payload_cursor = Cursor::new(payload.as_mut_slice());
-    write_packet(
-        &mut payload_cursor,
-        PacketHeader {
-            command: CmdType::P2PInitHandshakeReq as u16,
-            channel_id: 0,
-            flags: 0,
-            command_options: 0x18,
-            session_id: 0,
-            channel_flags: 0,
-        },
+    make_record(
+        RecordType::MasterHandshake,
+        session.session_id,
+        RECORD_SIZE,
+        EXPECTED_PACKET_SIZE,
+        RecordEncryption::Rsa,
+        |_| Ok(()),
         |writer| {
-            writer.write_le_u16(session.nonce1)?;
-            writer.write_le_u16(0)?;
-            writer.write_bytes(&session.aes_key)?;
-            writer.write_bytes(&session.aes_iv)?;
-            writer.write_bytes(&session.device_id)?;
-            writer.write_bytes(&get_realm().as_bytes()[0..0x10])?;
-            writer.write_u8(0x6)?;
-            writer.write_u8((session.session_id == 0xffff) as u8)?;
-            writer.write_le_u16(0)?;
-            Ok(())
+            write_packet(
+                writer,
+                PacketHeader {
+                    command: CmdType::P2PInitHandshakeReq as u16,
+                    channel_id: 0,
+                    flags: 0,
+                    command_options: 0x18,
+                    session_id: 0,
+                    channel_flags: 0,
+                },
+                |writer| {
+                    writer.write_le_u16(session.nonce1)?;
+                    writer.write_le_u16(0)?;
+                    writer.write_bytes(&session.aes_key)?;
+                    writer.write_bytes(&session.aes_iv)?;
+                    writer.write_bytes(&session.device_id)?;
+                    writer.write_bytes(&get_realm().as_bytes()[0..0x10])?;
+                    writer.write_u8(0x6)?;
+                    writer.write_u8((session.session_id == 0xffff) as u8)?;
+                    writer.write_le_u16(0)?;
+                    Ok(())
+                },
+                EXPECTED_CONTENT_SIZE,
+            )
         },
-        EXPECTED_CONTENT_SIZE,
-    )?;
-
-    let encrypted_size = rsa_encrypt(&payload, &mut packet[constants::RECORD_HEADER_SIZE..]);
-    let mut packet_cursor = Cursor::new(&mut packet);
-    packet_cursor.set_position(rsa_encrypted_size_offset);
-    packet_cursor.write_le_u16(encrypted_size as u16)?;
-
-    packet.truncate(constants::RECORD_HEADER_SIZE + encrypted_size);
-
-    Ok(packet)
+    )
 }
 
 fn make_record<WriteExtendedHeader, WritePayload>(
@@ -233,8 +248,7 @@ fn make_record<WriteExtendedHeader, WritePayload>(
     session_id: u32,
     expected_record_size: usize,
     expected_payload_size: usize,
-    aes_key: [u8; 16],
-    aes_iv: [u8; 12],
+    encryption: RecordEncryption,
     write_extended_header: WriteExtendedHeader,
     write_payload: WritePayload,
 ) -> Result<Vec<u8>>
@@ -271,29 +285,28 @@ where
 
     assert_eq!(payload_size, expected_payload_size);
 
-    let record_size =
-        header_size - constants::RECORD_HEADER_SIZE + payload_size + constants::RECORD_AES_TAG_SIZE;
+    let extended_header_size = header_size - constants::RECORD_HEADER_SIZE;
+    let record_size = extended_header_size + encryption.encrypted_size(payload_size);
     assert_eq!(record_size, expected_record_size);
     let expected_total_size = constants::RECORD_HEADER_SIZE + expected_record_size;
     assert!(expected_total_size <= constants::RECORD_PACKET_MAX_SIZE);
 
-    let record_size: u16 = record_size
+    let wire_record_size: u16 = record_size
         .try_into()
         .context("Record size does not fit in its wire field")?;
 
     // The record size is part of the AES-GCM AAD and must be finalized before
-    // encrypting the packet.
+    // encrypting the payload.
     {
         let current_position = record_writer.position();
         record_writer.set_position(record_header_size_position);
-        record_writer.write_le_u16(record_size as u16)?;
+        record_writer.write_le_u16(wire_record_size)?;
         record_writer.set_position(current_position);
     }
 
     let aad = &record_writer.get_ref()[..header_size];
-    let (ciphertext, tag) = encrypt_aes_128_gcm(&payload, aad, aes_key, aes_iv)?;
-    assert_eq!(ciphertext.len(), expected_payload_size);
-    assert_eq!(tag.len(), constants::RECORD_AES_TAG_SIZE);
+    let (ciphertext, tag) = encryption.encrypt(&payload, aad)?;
+    assert_eq!(ciphertext.len() + tag.len(), record_size - extended_header_size);
 
     record_writer.write_bytes(&ciphertext)?;
     record_writer.write_bytes(&tag)?;
@@ -347,8 +360,10 @@ fn make_record_send_p2p_init_handshake_req(
         session.session_id,
         RECORD_SIZE,
         EXPECTED_PACKET_SIZE,
-        aes_key,
-        session.aes_iv,
+        RecordEncryption::Aes128Gcm {
+            key: aes_key,
+            iv: session.aes_iv,
+        },
         move |writer| {
             let der = session.ecdh_key.public_key_to_der()?;
             assert_eq!(der.len(), 0x5b, "ECDH DER key must be exactly 0x5B bytes");
@@ -773,6 +788,20 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 #[cfg(test)]
 mod packet_writer_tests {
     use super::*;
+
+    #[test]
+    fn master_handshake_uses_the_common_record_layout() {
+        let session = IotcSession::new(0x12345678, "ABCDEFGHIJKLMNOPQRST").unwrap();
+
+        let record = make_record_send_master_handshake(&session).unwrap();
+
+        assert_eq!(record.len(), constants::RECORD_HEADER_SIZE + 0x100);
+        assert_eq!(&record[0..4], &constants::RECORD_MAGIC_NUMBER.to_le_bytes());
+        assert_eq!(record[4], 1);
+        assert_eq!(record[5], RecordType::MasterHandshake as u8);
+        assert_eq!(&record[6..8], &0x100_u16.to_le_bytes());
+        assert_eq!(&record[8..12], &session.session_id.to_le_bytes());
+    }
 
     #[test]
     fn write_packet_writes_header_and_patches_content_size() {

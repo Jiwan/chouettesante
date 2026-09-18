@@ -11,6 +11,11 @@ use thiserror::Error;
 
 use super::constants;
 
+pub(super) fn rsa_encrypted_size(plaintext_size: usize) -> usize {
+    let rsa_key = Rsa::public_key_from_pem(constants::PUB_RSA_KEY.as_bytes()).unwrap();
+    plaintext_size.next_multiple_of(rsa_key.size() as usize)
+}
+
 pub(super) fn rsa_encrypt(from: &[u8], to: &mut [u8]) -> usize {
     // From TUTK3rdRSAEncrypt in libTUTKGlobalAPIs.so.
     let rsa_key = Rsa::public_key_from_pem(constants::PUB_RSA_KEY.as_bytes()).unwrap();
