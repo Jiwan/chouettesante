@@ -55,7 +55,7 @@ bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     struct PacketFlags: u8 {
         const CypherExtendHeaderOnly = 0b0001;
-        const UnknownFlag0x2 = 0b0100;
+        const UnknownFlag0x2 = 0b0010;
         const UnknownFlag0x4 = 0b0100;
         const UnknownFlag0x8 = 0b1000;
     }
@@ -161,6 +161,21 @@ struct PacketHeader {
     channel_flags: u8, // Speculative field.
 }
 
+// Writes a packet, from _IOTC_Packet_Handler in libIOTCAPIs.so. The header is
+// 0x10 bytes, little-endian unless noted otherwise:
+//
+// Offset  Size  Field
+// 0x00    2     Magic number (PACKET_MAGIC_NUMBER, 0x0204)
+// 0x02    1     Version (PACKET_VERSION, 0x1e)
+// 0x03    1     Flags (PacketFlags)
+// 0x04    2     Content size
+// 0x06    2     Unknown
+// 0x08    2     Command (CmdType)
+// 0x0a    2     Command options
+// 0x0c    2     Session id
+// 0x0e    1     Channel id
+// 0x0f    1     Channel flags
+// 0x10    ...   write_content data (will match content size)
 fn write_packet<WriteContent>(
     packet_writer: &mut Cursor<&mut [u8]>,
     header: PacketHeader,
@@ -442,7 +457,7 @@ impl IotcSession {
         Ok(Self {
             session_id,
             device_id: device_id.as_bytes().try_into()?,
-            aes_key: [0; 16],
+            aes_key,
             aes_iv,
             nonce1,
             nonce2,
