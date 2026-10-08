@@ -333,7 +333,7 @@ where
     Ok(record)
 }
 
-fn make_p2p_init_packet(packet_writer: &mut Cursor<&mut [u8]>) -> Result<()> {
+fn make_p2p_init_packet(packet_writer: &mut Cursor<&mut [u8]>, session: &IotcSession) -> Result<()> {
     const EXPECTED_CONTENT_SIZE: usize = 0x24;
 
     write_packet(
@@ -347,7 +347,9 @@ fn make_p2p_init_packet(packet_writer: &mut Cursor<&mut [u8]>) -> Result<()> {
             channel_flags: 0,
         },
         |writer| {
-            writer.write_le_u16(0)?;
+            // From iotcRecordSendP2PInitHandshakeReq in libIOTCAPIs.so:
+            // the nonce2 is checked against the P2PInitHandshakeResp.
+            writer.write_le_u16(session.nonce2)?;
             writer.write_le_u16(0)?;
             writer.write_le_u64(0)?; // Need to figure that one out: *(undefined8 *)param_4;
             writer.write_le_u64(0)?; // Need to figure that one out: *(undefined8 *)(param_4 + 8)
@@ -361,34 +363,33 @@ fn make_p2p_init_packet(packet_writer: &mut Cursor<&mut [u8]>) -> Result<()> {
 }
 
 fn make_record_send_p2p_init_handshake_req(
-    session: &IotcSession,
+    session: &mut IotcSession,
     server_entry: &ServerEntry,
 ) -> Result<Vec<u8>> {
     // From iotcRecordSendP2PInitHandshakeReq in libIOTCAPIs.so.
     const RECORD_SIZE: usize = 0xac;
     const EXPECTED_PACKET_SIZE: usize = 0x34;
 
-    let aes_key = derive_aes_128_key(&session.ecdh_key, &server_entry.pub_key)?;
+    let peer_address = SocketAddr::from((server_entry.ip_address, server_entry.port));
+    let P2PPeer { aes_key, aes_iv } =
+        *session.get_or_create_peer(&peer_address, &server_entry.pub_key)?;
+
+    let der = session.ecdh_key.public_key_to_der()?;
+    assert_eq!(der.len(), 0x5b, "ECDH DER key must be exactly 0x5B bytes");
 
     make_record(
         RecordType::P2PInitHandshakeReq,
         session.session_id,
         RECORD_SIZE,
         EXPECTED_PACKET_SIZE,
-        RecordEncryption::Aes128Gcm {
-            key: aes_key,
-            iv: session.aes_iv,
-        },
+        RecordEncryption::Aes128Gcm { key: aes_key, iv: aes_iv },
         move |writer| {
-            let der = session.ecdh_key.public_key_to_der()?;
-            assert_eq!(der.len(), 0x5b, "ECDH DER key must be exactly 0x5B bytes");
-
-            writer.write_bytes(&session.aes_iv)?;
+            writer.write_bytes(&aes_iv)?;
             writer.write_bytes(&der)?;
             writer.write_u8(0)?;
             Ok(())
         },
-        make_p2p_init_packet,
+        |writer| make_p2p_init_packet(writer, session),
     )
 }
 
@@ -433,6 +434,14 @@ pub struct IotcSession {
     nonce1: u16,
     nonce2: u16,
     ecdh_key: EcKey<openssl::pkey::Private>,
+    // Mirrors Session.peers[0..0xb] in libIOTCAPIs.so: one set of P2P
+    // credentials per server address.
+    peers: HashMap<SocketAddr, P2PPeer>,
+}
+
+struct P2PPeer {
+    aes_key: [u8; 16],
+    aes_iv: [u8; 12],
 }
 
 #[derive(Debug)]
@@ -462,7 +471,30 @@ impl IotcSession {
             nonce1,
             nonce2,
             ecdh_key: generate_ecdh_key()?,
+            peers: HashMap::new(),
         })
+    }
+
+    // Mirrors iotcGetP2PKeyInfo/iotcUpdateP2PAESKeys in libIOTCAPIs.so: the
+    // peer AES key is derived from the ECDH shared secret with that peer's
+    // public key and the IV is freshly randomized per peer, both cached by
+    // server address.
+    fn get_or_create_peer(
+        &mut self,
+        address: &SocketAddr,
+        peer_pub_key: &PKey<Public>,
+    ) -> Result<&P2PPeer> {
+        if !self.peers.contains_key(address) {
+            let aes_key = derive_aes_128_key(&self.ecdh_key, peer_pub_key)?;
+            let mut aes_iv = [0u8; 12];
+            rand::fill(&mut aes_iv);
+            self.peers.insert(
+                *address,
+                P2PPeer { aes_key, aes_iv },
+            );
+        }
+
+        Ok(self.peers.get(address).unwrap())
     }
 }
 
@@ -794,7 +826,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     println!("Received response: {:?} {}", buf, buf.len());
 
-    let p2p_init_record = make_record_send_p2p_init_handshake_req(&session, &server_entries[0])?;
+    let p2p_init_record = make_record_send_p2p_init_handshake_req(session, &server_entries[0])?;
     socket.send_to(&p2p_init_record, recv_addr).await?;
 
     Ok(())
@@ -803,6 +835,35 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 #[cfg(test)]
 mod packet_writer_tests {
     use super::*;
+
+    fn test_public_key() -> Result<PKey<Public>> {
+        let key = generate_ecdh_key()?;
+        let der = key.public_key_to_der()?;
+        Ok(PKey::public_key_from_der(&der)?)
+    }
+
+    #[test]
+    fn p2p_peer_credentials_are_cached_per_server_address() {
+        let mut session = IotcSession::new(1, "ABCDEFGHIJKLMNOPQRST").unwrap();
+
+        let addr_a = SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 1111));
+        let pub_a = test_public_key().unwrap();
+        let peer_a = session.get_or_create_peer(&addr_a, &pub_a).unwrap();
+        let (key_a, iv_a) = (peer_a.aes_key, peer_a.aes_iv);
+
+        // A second handshake to the same server reuses the cached
+        // credentials instead of re-deriving them.
+        let peer_a_again = session.get_or_create_peer(&addr_a, &pub_a).unwrap();
+        assert_eq!(key_a, peer_a_again.aes_key);
+        assert_eq!(iv_a, peer_a_again.aes_iv);
+
+        // A different server gets its own key and a fresh IV.
+        let addr_b = SocketAddr::from((Ipv4Addr::new(5, 6, 7, 8), 2222));
+        let pub_b = test_public_key().unwrap();
+        let peer_b = session.get_or_create_peer(&addr_b, &pub_b).unwrap();
+        assert_ne!(key_a, peer_b.aes_key);
+        assert_ne!(iv_a, peer_b.aes_iv);
+    }
 
     #[test]
     fn master_handshake_uses_the_common_record_layout() {
