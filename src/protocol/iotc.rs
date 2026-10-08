@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     io::{Cursor, Read, Seek},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::{Duration, Instant},
 };
 
 use openssl::{
@@ -10,13 +11,14 @@ use openssl::{
 };
 use rand::prelude::*;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use bitflags::bitflags;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use serde::{de, Deserialize, Serialize};
 use serde_json;
 use thiserror::Error;
 use tokio::net::{lookup_host, UdpSocket};
+use tokio::time::timeout;
 use tracing::{debug, warn};
 use tracing_subscriber::field::debug;
 
@@ -65,6 +67,12 @@ bitflags! {
 enum RecordType {
     MasterHandshake = 0x1,
     P2PInitHandshakeReq = 0x2,
+    // From the switch in iotcRecordHandler in libIOTCAPIs.so: only types
+    // 1, 3, 4 and 5 are parsed on the client side. Type 2 records are
+    // send-only.
+    P2PInitHandshakeResp = 0x3,
+    KeyPush = 0x4,
+    KeepAlive = 0x5,
 }
 
 enum RecordEncryption {
@@ -106,6 +114,10 @@ impl TryFrom<u8> for RecordType {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0x1 => Ok(RecordType::MasterHandshake),
+            0x2 => Ok(RecordType::P2PInitHandshakeReq),
+            0x3 => Ok(RecordType::P2PInitHandshakeResp),
+            0x4 => Ok(RecordType::KeyPush),
+            0x5 => Ok(RecordType::KeepAlive),
             _ => Err(RecordConversionError::InvalidRecordType),
         }
     }
@@ -115,6 +127,15 @@ impl TryFrom<u8> for RecordType {
 #[derive(Debug, PartialEq, IntoPrimitive, TryFromPrimitive)]
 enum CmdType {
     P2PInit = 0x217,
+    // Response to the P2PInitHandshakeReq, carried by a type 3 record.
+    // Also the cmd used by the keepalive exchange.
+    P2PHandshake = 0x218,
+    // Key push from the P2P server, carried by a type 4 record.
+    KeyPush = 0x30d,
+    // Device status notifications from the P2P servers, from
+    // _IOTC_Packet_Handler in libIOTCAPIs.so.
+    DeviceOfflineStatus = 0x227,
+    DeviceOnlineStatus = 0x229,
     UnknownCmd0x408 = 0x408,
     P2PInitHandshakeReq = 0x100b,
     P2PInitHandshakeResp = 0x100c,
@@ -347,15 +368,16 @@ fn make_p2p_init_packet(packet_writer: &mut Cursor<&mut [u8]>, session: &IotcSes
             channel_flags: 0,
         },
         |writer| {
-            // From iotcRecordSendP2PInitHandshakeReq in libIOTCAPIs.so:
-            // the nonce2 is checked against the P2PInitHandshakeResp.
+            // From iotcRecordSendP2PInitHandshakeReq (0x217 mode) in
+            // libIOTCAPIs.so, with client_params = the session: the nonce2 is
+            // checked against the P2PInitHandshakeResp, then comes the
+            // device uid, then p2p_config fields that are zeroed in the
+            // AddUDPPreCheckTask path.
             writer.write_le_u16(session.nonce2)?;
             writer.write_le_u16(0)?;
-            writer.write_le_u64(0)?; // Need to figure that one out: *(undefined8 *)param_4;
-            writer.write_le_u64(0)?; // Need to figure that one out: *(undefined8 *)(param_4 + 8)
-            writer.write_le_u32(0)?; // Need to figure that one out: *(undefined4 *)(param_4 + 0x10)
-            writer.write_le_u32(0)?; // Need to figure that one out: *(undefined4 *)(param_5 + 2)
-            writer.write_le_u64(0)?; // Need to figure that one out: *(undefined8 *)*(byte **)(param_5 + 4);
+            writer.write_bytes(&session.device_id)?;
+            writer.write_le_u32(0)?; // *(undefined4 *)(p2p_config + 2)
+            writer.write_le_u64(0)?; // *(undefined8 *)*(byte **)(p2p_config + 4)
             Ok(())
         },
         EXPECTED_CONTENT_SIZE,
@@ -371,7 +393,7 @@ fn make_record_send_p2p_init_handshake_req(
     const EXPECTED_PACKET_SIZE: usize = 0x34;
 
     let peer_address = SocketAddr::from((server_entry.ip_address, server_entry.port));
-    let P2PPeer { aes_key, aes_iv } =
+    let P2PPeer { aes_key, aes_iv, .. } =
         *session.get_or_create_peer(&peer_address, &server_entry.pub_key)?;
 
     let der = session.ecdh_key.public_key_to_der()?;
@@ -426,6 +448,144 @@ fn make_hello_server(session: &IotcSession) -> Result<Vec<u8>> {
     Ok(packet)
 }
 
+fn make_record_send_p2p_keep_alive(peer: &P2PPeer) -> Result<Vec<u8>> {
+    // From iotcRecordSendP2PKeepAlive in libIOTCAPIs.so: a completely
+    // unencrypted type 5 record, 0x18 bytes total.
+    const RECORD_SIZE: usize = 0xc;
+
+    let record_sid = peer
+        .record_sid
+        .context("Cannot send a keepalive before the peer record SID is known")?;
+
+    let mut record = vec![0u8; constants::RECORD_HEADER_SIZE + RECORD_SIZE];
+    let mut writer = Cursor::new(record.as_mut_slice());
+    writer.write_le_u32(constants::RECORD_MAGIC_NUMBER)?;
+    writer.write_u8(1)?;
+    writer.write_u8(RecordType::KeepAlive as u8)?;
+    writer.write_le_u16(RECORD_SIZE as u16)?;
+    writer.write_le_u32(0xffff)?;
+    writer.write_le_u32(record_sid)?;
+    writer.write_le_u32(0)?;
+    // The original also writes *(undefined4 *)(param_4 + 4) here, which we
+    // could not identify; zero for now.
+    writer.write_le_u32(0)?;
+
+    Ok(record)
+}
+
+// From the case '\x03' handler in iotcRecordHandler in libIOTCAPIs.so: the
+// response to the P2PInitHandshakeReq.
+fn parse_record_p2p_init_handshake_resp(
+    buffer: &[u8],
+    record_size: usize,
+    session: &mut IotcSession,
+    from: SocketAddr,
+) -> Result<u16> {
+    // Layout: header (aad) | payload | tag
+    // Size:     0x0c         |   ...   | 0x10
+    let aad = &buffer[0..constants::RECORD_HEADER_SIZE];
+    let ciphertext = &buffer[constants::RECORD_HEADER_SIZE
+        ..constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE];
+    let tag =
+        &buffer[constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE..];
+
+    let (nonce2, device_id) = (session.nonce2, session.device_id);
+    let peer = session
+        .peer_mut(&from)
+        .with_context(|| format!("Handshake response from an unknown peer: {}", from))?;
+
+    let packet = decrypt_aes_128_gcm(ciphertext, aad, tag, peer.aes_key, peer.aes_iv)?;
+
+    if packet.len() != 0x48 {
+        warn!(
+            "Unexpected handshake response packet size: 0x{:x}",
+            packet.len()
+        );
+        crate::utils::hexdump(&packet);
+    }
+
+    let mut reader = Cursor::new(&packet);
+    let magic_number = reader.read_le_u16()?;
+    if magic_number != constants::PACKET_MAGIC_NUMBER {
+        return Err(ParseError::WrongPacketMagicNumber.into());
+    }
+    let _ = reader.read_u8()?; // Version.
+    let _ = reader.read_u8()?; // Flags.
+    let content_size = reader.read_le_u16()? as usize;
+    let _ = reader.read_le_u16()?; // Unknown.
+
+    let cmd_type = reader.read_le_u16()?;
+    if cmd_type != CmdType::P2PHandshake as u16 {
+        return Err(anyhow::anyhow!(
+            "Unexpected handshake response cmd: 0x{:04x}",
+            cmd_type
+        ));
+    }
+
+    let mut content = Cursor::new(&packet[PACKET_HEADER_SIZE..]);
+    let nonce2_echo = content.read_le_u16()?;
+    if nonce2_echo != nonce2 {
+        return Err(anyhow::anyhow!(
+            "Wrong nonce2 in handshake response: 0x{:04x}",
+            nonce2_echo
+        ));
+    }
+
+    let _ = content.read_le_u16()?;
+    let record_sid = content.read_le_u32()?;
+    let uid = content.read_bytes::<20>()?;
+    if uid != device_id {
+        return Err(anyhow::anyhow!(
+            "Wrong device id in handshake response: {:?}",
+            uid
+        ));
+    }
+
+    // Keepalive interval, in seconds, at content offset 0x34.
+    let keepalive_interval =
+        Cursor::new(&packet[PACKET_HEADER_SIZE + 0x34..]).read_le_u16()?;
+
+    peer.record_sid = Some(record_sid);
+    session.state = SessionState::Connected;
+
+    debug!(
+        "Handshake response accepted: record sid 0x{:08x}, keepalive interval {}s (content size 0x{:x})",
+        record_sid, keepalive_interval, content_size
+    );
+
+    Ok(keepalive_interval)
+}
+
+// From the case '\x05' handler in iotcRecordHandler in libIOTCAPIs.so: the
+// server's keepalive, fully unencrypted.
+fn parse_record_keep_alive(
+    buffer: &[u8],
+    record_size: usize,
+    session: &IotcSession,
+    from: SocketAddr,
+) -> Result<()> {
+    let mut reader = Cursor::new(buffer);
+    reader.set_position(constants::RECORD_HEADER_SIZE as u64);
+    let record_sid = reader.read_le_u32()?;
+
+    let peer = session
+        .peers
+        .get(&from)
+        .with_context(|| format!("Keepalive from an unknown peer: {}", from))?;
+
+    if Some(record_sid) != peer.record_sid {
+        return Err(anyhow::anyhow!(
+            "Keepalive from the wrong peer sid: 0x{:08x} vs {:?}",
+            record_sid,
+            peer.record_sid
+        ));
+    }
+
+    debug!("Keepalive received (record size 0x{:x})", record_size);
+
+    Ok(())
+}
+
 pub struct IotcSession {
     session_id: u32,
     device_id: [u8; 20],
@@ -437,11 +597,24 @@ pub struct IotcSession {
     // Mirrors Session.peers[0..0xb] in libIOTCAPIs.so: one set of P2P
     // credentials per server address.
     peers: HashMap<SocketAddr, P2PPeer>,
+    state: SessionState,
 }
 
 struct P2PPeer {
     aes_key: [u8; 16],
     aes_iv: [u8; 12],
+    // Learned from the type 3 handshake response (content offset 0x04) and
+    // echoed in every type 4/5 record from this peer. See FUN_0004d570.
+    record_sid: Option<u32>,
+}
+
+// Mirrors Session.field_0x740 in libIOTCAPIs.so.
+#[derive(Debug, PartialEq)]
+enum SessionState {
+    Connecting,
+    // Set when the type 3 P2PInitHandshakeResp is accepted (state 6 in the
+    // binary).
+    Connected,
 }
 
 #[derive(Debug)]
@@ -472,6 +645,7 @@ impl IotcSession {
             nonce2,
             ecdh_key: generate_ecdh_key()?,
             peers: HashMap::new(),
+            state: SessionState::Connecting,
         })
     }
 
@@ -490,11 +664,15 @@ impl IotcSession {
             rand::fill(&mut aes_iv);
             self.peers.insert(
                 *address,
-                P2PPeer { aes_key, aes_iv },
+                P2PPeer { aes_key, aes_iv, record_sid: None },
             );
         }
 
         Ok(self.peers.get(address).unwrap())
+    }
+
+    fn peer_mut(&mut self, address: &SocketAddr) -> Option<&mut P2PPeer> {
+        self.peers.get_mut(address)
     }
 }
 
@@ -528,6 +706,7 @@ impl IotcSessionManager {
 }
 
 pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
+    let buffer_len = buffer.len();
     let (header, content) = buffer
         .split_at_mut_checked(PACKET_HEADER_SIZE)
         .context(ParseError::InvalidHeaderSize)?;
@@ -557,16 +736,28 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
     let channelId = reader.read_u8()?;
     let _channel_flags = reader.read_u8()?; // TODO: Confirm this field's meaning.
 
-    // From FUN_0004a770 in libIOTCAPIs.so
-    let cyphered_size = if packet_flags.contains(PacketFlags::CypherExtendHeaderOnly) {
-        0x30
-    } else {
-        packet_size as usize
-    };
-
-    if cyphered_size > content.len() {
-        return Err(ParseError::InvalidCypheredContentSize.into());
+    // From FUN_0004a770 in libIOTCAPIs.so: a packet is only processed when
+    // the datagram is exactly the header plus the announced content size;
+    // anything else is silently dropped.
+    if packet_size as usize + PACKET_HEADER_SIZE != buffer_len {
+        warn!(
+            "Dropping packet with inconsistent size: {} + 0x{:x} != {}",
+            packet_size,
+            PACKET_HEADER_SIZE,
+            buffer_len
+        );
+        return Ok(());
     }
+
+    // When the CypherExtendHeaderOnly flag is set, only the first 0x30
+    // content bytes are cyphered — but if the content is shorter than that,
+    // the whole content is cyphered (charlie_crypt clamps cryptedSize to
+    // the buffer size).
+    let cyphered_size = if packet_flags.contains(PacketFlags::CypherExtendHeaderOnly) {
+        0x30.min(content.len())
+    } else {
+        content.len()
+    };
 
     decypher(&mut content[..cyphered_size]);
 
@@ -621,6 +812,20 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
         }
         CmdType::P2PInit | CmdType::P2PInitHandshakeReq | CmdType::P2PInitHandshakeResp => {
             debug!("Received P2P handshake packet");
+        }
+        CmdType::P2PHandshake | CmdType::KeyPush => {
+            debug!("Received P2P session packet");
+        }
+        CmdType::DeviceOfflineStatus => {
+            // From _IOTC_Packet_Handler: the content is the 20-byte device
+            // uid; the server reports the device as not connected there.
+            if content.len() >= 20 {
+                let uid = &content[..20];
+                debug!("Device {:?} reported offline by this server", uid);
+            }
+        }
+        CmdType::DeviceOnlineStatus => {
+            debug!("Device online status packet received");
         }
         CmdType::HelloServer => {
             debug!("Received HelloServer packet");
@@ -735,44 +940,85 @@ where
     Ok(servers)
 }
 
-pub fn parse(buffer: &mut [u8], session: Option<&IotcSession>) -> Result<Option<Vec<ServerEntry>>> {
+#[derive(Debug)]
+pub enum ParseOutcome {
+    ServerList(Vec<ServerEntry>),
+    HandshakeResp { keepalive_interval: u16 },
+    KeepAlive,
+    Packet,
+    Other,
+}
+
+pub fn parse(
+    buffer: &mut [u8],
+    session: Option<&mut IotcSession>,
+    from: Option<SocketAddr>,
+) -> Result<ParseOutcome> {
     // From iotcRecordHandler in libIOTCAPIs.so / handle_buffer
     let mut buf = Cursor::new(&*buffer);
     let record_magic_number = buf.read_le_u32()?;
 
-    match record_magic_number {
-        constants::RECORD_MAGIC_NUMBER => {
-            // Process as record
-            if let Some(session) = session {
-                assert!(buffer.len() >= constants::RECORD_HEADER_SIZE);
-                assert!(buffer.len() <= constants::RECORD_PACKET_MAX_SIZE);
+    if record_magic_number != constants::RECORD_MAGIC_NUMBER {
+        // Process as packet
+        parse_packet(buffer)?;
+        return Ok(ParseOutcome::Packet);
+    }
 
-                let mut cursor = Cursor::new(&*buffer);
-                let _ = cursor.read_le_u32()?; // magic number already read
+    // Process as record
+    assert!(buffer.len() >= constants::RECORD_HEADER_SIZE);
+    assert!(buffer.len() <= constants::RECORD_PACKET_MAX_SIZE);
 
-                let _ = cursor.read_u8()?;
-                let record_type: RecordType = cursor.read_u8()?.try_into()?;
+    let mut cursor = Cursor::new(&*buffer);
+    let _ = cursor.read_le_u32()?; // magic number already read
+    let _ = cursor.read_u8()?; // version
+    let record_type: RecordType = cursor.read_u8()?.try_into()?;
+    let record_size = u16::from_le_bytes([buffer[6], buffer[7]]) as usize;
 
-                match record_type {
-                    RecordType::MasterHandshake => {
-                        parse_record_handshake(&buffer, &mut cursor, session).map(Some)
-                    }
-                    _ => Err(anyhow::anyhow!("Invalid record type")),
-                }
-            } else {
-                Ok(None)
-            }
+    let Some(session) = session else {
+        warn!("Received a record without a session to attach it to");
+        return Ok(ParseOutcome::Other);
+    };
+
+    match record_type {
+        RecordType::MasterHandshake => {
+            let servers = parse_record_handshake(&buffer, &mut cursor, session)?;
+            Ok(ParseOutcome::ServerList(servers))
         }
-        _ => {
-            // Process as packet
-            parse_packet(buffer)?;
-            Ok(None)
+        RecordType::P2PInitHandshakeResp => {
+            let Some(from) = from else {
+                bail!("Received a handshake response without a source address");
+            };
+            let keepalive_interval =
+                parse_record_p2p_init_handshake_resp(&buffer, record_size, session, from)?;
+            Ok(ParseOutcome::HandshakeResp {
+                keepalive_interval,
+            })
+        }
+        RecordType::KeepAlive => {
+            let Some(from) = from else {
+                bail!("Received a keepalive without a source address");
+            };
+            parse_record_keep_alive(&buffer, record_size, session, from)?;
+            Ok(ParseOutcome::KeepAlive)
+        }
+        RecordType::KeyPush => {
+            // TODO: Reverse the type 4 record (cmd 0x30d) further: per-peer
+            // decryption with the raw record SID as AAD, the random id
+            // replay check and the 8x16-byte key entries.
+            warn!("Received a key push record ({} bytes)", buffer.len());
+            crate::utils::hexdump(buffer);
+            Ok(ParseOutcome::Other)
+        }
+        RecordType::P2PInitHandshakeReq => {
+            warn!("Received an unexpected P2PInitHandshakeReq record");
+            Ok(ParseOutcome::Other)
         }
     }
 }
 
 pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
-    // From IOTC_Connect_UDP_Inner in libIOTCAPIs.so
+    // From IOTC_Connect_UDP_Inner, AddUDPPreCheckTask and FUN_00037d90 in
+    // libIOTCAPIs.so.
 
     let mut session_manager = IotcSessionManager::new();
     let session = session_manager.create_session(uid);
@@ -781,53 +1027,143 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     debug!("Master domain name: {}", master_domain_name);
 
-    let send_addr = lookup_host((master_domain_name.as_str(), 10240))
-        .await?
-        .next()
-        .context(format!(
-            "Failed to resolve master domain {}",
-            master_domain_name
-        ))?;
+    // From AddUDPQueryDeviceInfoTask: the handshake goes to every resolved
+    // master address, resent every 500ms (FUN_00036e90) until a response.
+    let master_addrs: Vec<SocketAddr> = lookup_host((master_domain_name.as_str(), 10240))
+        .await
+        .context("Failed to resolve the master domain")?
+        .collect();
 
-    let record = make_record_send_master_handshake(&session)?;
+    if master_addrs.is_empty() {
+        bail!("Failed to resolve master domain {}", master_domain_name);
+    }
+
+    debug!("Master addresses: {:?}", master_addrs);
+
+    let record = make_record_send_master_handshake(session)?;
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    socket.send_to(&record, send_addr).await?;
 
-    debug!("Socket port after bind: {}", socket.local_addr()?.port());
-
+    let master_deadline = Instant::now() + Duration::from_secs(60);
     let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
-    let (usize, _recv_addr) = socket.recv_from(&mut buf).await?;
-    buf.truncate(usize);
 
-    assert!(send_addr == _recv_addr);
+    let (n, recv_addr) = 'master: loop {
+        if Instant::now() > master_deadline {
+            bail!("Timed out waiting for the master handshake response");
+        }
 
-    debug!("Received response: {:?} {}", buf, buf.len());
+        for addr in &master_addrs {
+            socket.send_to(&record, addr).await?;
+        }
 
-    let server_entries = parse(&mut buf, Some(&session))?
-        .ok_or_else(|| anyhow::anyhow!("Expected record response"))?;
+        match timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, from))) => break 'master (n, from),
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_elapsed) => {}
+        }
+    };
 
-    let packet = make_hello_server(&session)?;
+    debug!("Master handshake sent, response received from {}", recv_addr);
+
+    buf.truncate(n);
+
+    let server_entries = match parse(&mut buf, Some(&mut *session), Some(recv_addr))? {
+        ParseOutcome::ServerList(servers) => servers,
+        outcome => bail!("Expected the master handshake response, got {:?}", outcome),
+    };
+
+    debug!(
+        "Master returned {} P2P server candidates",
+        server_entries.len()
+    );
+
+    // From HelloServer in libIOTCAPIs.so: one hello packet to every
+    // candidate, so that the P2P servers learn our public address.
+    let hello_packet = make_hello_server(session)?;
 
     for server_entry in &server_entries {
         let target = SocketAddr::from((server_entry.ip_address, server_entry.port));
-        socket.send_to(&packet, target).await?;
+        socket.send_to(&hello_packet, target).await?;
     }
 
-    debug!("Sent hello server packet to all candidates");
+    // From AddUDPPreCheckTask: the P2P init handshake request goes to every
+    // candidate, and is resent every 500ms until a response or a 60s
+    // timeout (FUN_00037d90).
+    let handshake_records: Vec<(SocketAddr, Vec<u8>)> = server_entries
+        .iter()
+        .map(|server_entry| {
+            let addr = SocketAddr::from((server_entry.ip_address, server_entry.port));
+            Ok((
+                addr,
+                make_record_send_p2p_init_handshake_req(session, server_entry)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+
+    let connect_deadline = Instant::now() + Duration::from_secs(60);
+    let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
+
+    let (keepalive_interval, connected_addr) = 'connect: loop {
+        if Instant::now() > connect_deadline {
+            bail!("Timed out waiting for the P2P handshake response");
+        }
+
+        for (addr, record) in &handshake_records {
+            socket.send_to(record, addr).await?;
+        }
+
+        loop {
+            match timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
+                Ok(Ok((n, from))) => {
+                    buf.truncate(n);
+                    debug!("Received {} bytes from {}", n, from);
+
+                    match parse(&mut buf, Some(&mut *session), Some(from))? {
+                        ParseOutcome::HandshakeResp {
+                            keepalive_interval,
+                        } => break 'connect (keepalive_interval, from),
+                        _ => continue,
+                    }
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_elapsed) => break, // 500ms without a response: resend.
+            }
+        }
+    };
+
+    debug!("Connected to P2P server {}", connected_addr);
+
+    // From iotcRecordSendP2PKeepAlive: unencrypted type 5 records at the
+    // server-provided interval (in seconds, from the handshake response).
+    let keepalive_period = Duration::from_secs(keepalive_interval.max(1) as u64);
+    let mut last_keepalive = Instant::now();
+    let observe_until = Instant::now() + Duration::from_secs(30);
 
     let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
-    let (usize, recv_addr) = socket.recv_from(&mut buf).await?;
-    buf.truncate(usize);
 
-    parse(&mut buf, None)?;
+    loop {
+        if last_keepalive.elapsed() >= keepalive_period {
+            let peer = session.peers.get(&connected_addr).unwrap();
+            let record = make_record_send_p2p_keep_alive(peer)?;
+            socket.send_to(&record, connected_addr).await?;
+            last_keepalive = Instant::now();
+            debug!("Keepalive sent");
+        }
 
-    crate::utils::hexdump(&buf);
+        match timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, from))) => {
+                buf.truncate(n);
+                debug!("Received {} bytes from {}", n, from);
+                parse(&mut buf, Some(&mut *session), Some(from))?;
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_elapsed) => {}
+        }
 
-    println!("Received response: {:?} {}", buf, buf.len());
-
-    let p2p_init_record = make_record_send_p2p_init_handshake_req(session, &server_entries[0])?;
-    socket.send_to(&p2p_init_record, recv_addr).await?;
+        if Instant::now() > observe_until {
+            break;
+        }
+    }
 
     Ok(())
 }
