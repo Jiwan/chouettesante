@@ -1,16 +1,10 @@
 use anyhow::{Context, Result};
-use authentication::google;
+use chouettesante::authentication::{self, google};
+use chouettesante::protocol::iotc::{connect, MasterRegion};
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, Level};
 use tracing_subscriber;
-mod authentication;
-
-mod charlie_cypher;
-mod protocol;
-mod utils;
-
-use protocol::iotc::{connect, MasterRegion};
 
 #[derive(Deserialize)]
 pub struct Credentials {

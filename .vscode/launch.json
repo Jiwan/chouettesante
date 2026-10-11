@@ -30,12 +30,12 @@
                 "args": [
                     "test",
                     "--no-run",
-                    "--bin=chouettesante",
+                    "--lib",
                     "--package=chouettesante"
                 ],
                 "filter": {
                     "name": "chouettesante",
-                    "kind": "bin"
+                    "kind": "lib"
                 }
             },
             "args": [],

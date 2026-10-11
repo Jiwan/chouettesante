@@ -1,5 +1,6 @@
+pub mod authentication;
 mod charlie_cypher;
-mod protocol;
+pub mod protocol;
 mod utils;
 
 use core::slice;

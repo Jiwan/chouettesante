@@ -18,12 +18,10 @@ use serde::{de, Deserialize, Serialize};
 use serde_json;
 use thiserror::Error;
 use tokio::net::{lookup_host, UdpSocket};
-use tokio::time::timeout;
 use tracing::{debug, warn};
 use tracing_subscriber::field::debug;
 
-use crate::utils::BinaryWriter;
-use crate::{charlie_cypher, charlie_cypher::decypher, utils::BinaryReader};
+use crate::{charlie_cypher, charlie_cypher::decypher, utils::{BinaryReader, BinaryWriter, SocketUtils}};
 
 use super::{
     constants,
@@ -121,6 +119,81 @@ impl TryFrom<u8> for RecordType {
             _ => Err(RecordConversionError::InvalidRecordType),
         }
     }
+}
+
+fn make_record<WriteExtendedHeader, WritePayload>(
+    record_type: RecordType,
+    session_id: u32,
+    expected_record_size: usize,
+    expected_payload_size: usize,
+    encryption: RecordEncryption,
+    write_extended_header: WriteExtendedHeader,
+    write_payload: WritePayload,
+) -> Result<Vec<u8>>
+where
+    WriteExtendedHeader: FnOnce(&mut Cursor<&mut [u8]>) -> Result<()>,
+    WritePayload: FnOnce(&mut Cursor<&mut [u8]>) -> Result<()>,
+{
+    assert!(expected_payload_size <= constants::RECORD_PACKET_MAX_SIZE);
+
+    let mut record = vec![0; constants::RECORD_PACKET_MAX_SIZE];
+    let mut record_writer = Cursor::new(record.as_mut_slice());
+    record_writer.write_le_u32(constants::RECORD_MAGIC_NUMBER)?;
+    record_writer.write_u8(1)?;
+    record_writer.write_u8(record_type as u8)?;
+    let record_header_size_position = record_writer.position();
+    record_writer.write_le_u16(0)?;
+    record_writer.write_le_u32(session_id)?;
+    assert_eq!(
+        record_writer.position() as usize,
+        constants::RECORD_HEADER_SIZE
+    );
+
+    write_extended_header(&mut record_writer)?;
+    let header_size = record_writer.position() as usize;
+    assert!(header_size >= constants::RECORD_HEADER_SIZE);
+    assert!(header_size <= constants::RECORD_PACKET_MAX_SIZE);
+
+    let mut payload = vec![0; constants::RECORD_PACKET_MAX_SIZE - header_size];
+    let mut payload_writer = Cursor::new(payload.as_mut_slice());
+
+    write_payload(&mut payload_writer)?;
+    let payload_size = payload_writer.position() as usize;
+    payload.truncate(payload_size);
+
+    assert_eq!(payload_size, expected_payload_size);
+
+    let extended_header_size = header_size - constants::RECORD_HEADER_SIZE;
+    let record_size = extended_header_size + encryption.encrypted_size(payload_size);
+    assert_eq!(record_size, expected_record_size);
+    let expected_total_size = constants::RECORD_HEADER_SIZE + expected_record_size;
+    assert!(expected_total_size <= constants::RECORD_PACKET_MAX_SIZE);
+
+    let wire_record_size: u16 = record_size
+        .try_into()
+        .context("Record size does not fit in its wire field")?;
+
+    // The record size is part of the AES-GCM AAD and must be finalized before
+    // encrypting the payload.
+    {
+        let current_position = record_writer.position();
+        record_writer.set_position(record_header_size_position);
+        record_writer.write_le_u16(wire_record_size)?;
+        record_writer.set_position(current_position);
+    }
+
+    let aad = &record_writer.get_ref()[..header_size];
+    let (ciphertext, tag) = encryption.encrypt(&payload, aad)?;
+    assert_eq!(ciphertext.len() + tag.len(), record_size - extended_header_size);
+
+    record_writer.write_bytes(&ciphertext)?;
+    record_writer.write_bytes(&tag)?;
+    let final_size = record_writer.position() as usize;
+    assert_eq!(final_size, expected_total_size);
+
+    record.truncate(final_size);
+
+    Ok(record)
 }
 
 #[repr(u16)]
@@ -277,81 +350,6 @@ fn make_record_send_master_handshake(session: &IotcSession) -> Result<Vec<u8>> {
             )
         },
     )
-}
-
-fn make_record<WriteExtendedHeader, WritePayload>(
-    record_type: RecordType,
-    session_id: u32,
-    expected_record_size: usize,
-    expected_payload_size: usize,
-    encryption: RecordEncryption,
-    write_extended_header: WriteExtendedHeader,
-    write_payload: WritePayload,
-) -> Result<Vec<u8>>
-where
-    WriteExtendedHeader: FnOnce(&mut Cursor<&mut [u8]>) -> Result<()>,
-    WritePayload: FnOnce(&mut Cursor<&mut [u8]>) -> Result<()>,
-{
-    assert!(expected_payload_size <= constants::RECORD_PACKET_MAX_SIZE);
-
-    let mut record = vec![0; constants::RECORD_PACKET_MAX_SIZE];
-    let mut record_writer = Cursor::new(record.as_mut_slice());
-    record_writer.write_le_u32(constants::RECORD_MAGIC_NUMBER)?;
-    record_writer.write_u8(1)?;
-    record_writer.write_u8(record_type as u8)?;
-    let record_header_size_position = record_writer.position();
-    record_writer.write_le_u16(0)?;
-    record_writer.write_le_u32(session_id)?;
-    assert_eq!(
-        record_writer.position() as usize,
-        constants::RECORD_HEADER_SIZE
-    );
-
-    write_extended_header(&mut record_writer)?;
-    let header_size = record_writer.position() as usize;
-    assert!(header_size >= constants::RECORD_HEADER_SIZE);
-    assert!(header_size <= constants::RECORD_PACKET_MAX_SIZE);
-
-    let mut payload = vec![0; constants::RECORD_PACKET_MAX_SIZE - header_size];
-    let mut payload_writer = Cursor::new(payload.as_mut_slice());
-
-    write_payload(&mut payload_writer)?;
-    let payload_size = payload_writer.position() as usize;
-    payload.truncate(payload_size);
-
-    assert_eq!(payload_size, expected_payload_size);
-
-    let extended_header_size = header_size - constants::RECORD_HEADER_SIZE;
-    let record_size = extended_header_size + encryption.encrypted_size(payload_size);
-    assert_eq!(record_size, expected_record_size);
-    let expected_total_size = constants::RECORD_HEADER_SIZE + expected_record_size;
-    assert!(expected_total_size <= constants::RECORD_PACKET_MAX_SIZE);
-
-    let wire_record_size: u16 = record_size
-        .try_into()
-        .context("Record size does not fit in its wire field")?;
-
-    // The record size is part of the AES-GCM AAD and must be finalized before
-    // encrypting the payload.
-    {
-        let current_position = record_writer.position();
-        record_writer.set_position(record_header_size_position);
-        record_writer.write_le_u16(wire_record_size)?;
-        record_writer.set_position(current_position);
-    }
-
-    let aad = &record_writer.get_ref()[..header_size];
-    let (ciphertext, tag) = encryption.encrypt(&payload, aad)?;
-    assert_eq!(ciphertext.len() + tag.len(), record_size - extended_header_size);
-
-    record_writer.write_bytes(&ciphertext)?;
-    record_writer.write_bytes(&tag)?;
-    let final_size = record_writer.position() as usize;
-    assert_eq!(final_size, expected_total_size);
-
-    record.truncate(final_size);
-
-    Ok(record)
 }
 
 fn make_p2p_init_packet(packet_writer: &mut Cursor<&mut [u8]>, session: &IotcSession) -> Result<()> {
@@ -705,13 +703,14 @@ impl IotcSessionManager {
     }
 }
 
-pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
+pub fn parse_packet(buffer: &[u8]) -> Result<()> {
     let buffer_len = buffer.len();
     let (header, content) = buffer
-        .split_at_mut_checked(PACKET_HEADER_SIZE)
+        .split_at_checked(PACKET_HEADER_SIZE)
         .context(ParseError::InvalidHeaderSize)?;
 
-    decypher(header);
+    let mut header = header.to_vec();
+    decypher(&mut header);
 
     let mut reader = Cursor::new(header);
     let magic_number = reader.read_le_u16()?;
@@ -759,6 +758,7 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
         content.len()
     };
 
+    let mut content = content.to_vec();
     decypher(&mut content[..cyphered_size]);
 
     // From: _IOTC_Packet_Handler in libIOTCAPIs.so
@@ -769,7 +769,7 @@ pub fn parse_packet(buffer: &mut [u8]) -> Result<()> {
         return Ok(());
     }
 
-    let mut reader: Cursor<&[u8]> = Cursor::new(content);
+    let mut reader: Cursor<&[u8]> = Cursor::new(content.as_slice());
 
     match cmd_type_enum.unwrap() {
         CmdType::UnknownCmd0x408 => {
@@ -950,12 +950,12 @@ pub enum ParseOutcome {
 }
 
 pub fn parse(
-    buffer: &mut [u8],
+    buffer: &[u8],
     session: Option<&mut IotcSession>,
     from: Option<SocketAddr>,
 ) -> Result<ParseOutcome> {
     // From iotcRecordHandler in libIOTCAPIs.so / handle_buffer
-    let mut buf = Cursor::new(&*buffer);
+    let mut buf = Cursor::new(buffer);
     let record_magic_number = buf.read_le_u32()?;
 
     if record_magic_number != constants::RECORD_MAGIC_NUMBER {
@@ -968,7 +968,7 @@ pub fn parse(
     assert!(buffer.len() >= constants::RECORD_HEADER_SIZE);
     assert!(buffer.len() <= constants::RECORD_PACKET_MAX_SIZE);
 
-    let mut cursor = Cursor::new(&*buffer);
+    let mut cursor = Cursor::new(buffer);
     let _ = cursor.read_le_u32()?; // magic number already read
     let _ = cursor.read_u8()?; // version
     let record_type: RecordType = cursor.read_u8()?.try_into()?;
@@ -1047,7 +1047,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     let master_deadline = Instant::now() + Duration::from_secs(60);
     let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
 
-    let (n, recv_addr) = 'master: loop {
+    let (data, recv_addr) = 'master: loop {
         if Instant::now() > master_deadline {
             bail!("Timed out waiting for the master handshake response");
         }
@@ -1056,8 +1056,8 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
             socket.send_to(&record, addr).await?;
         }
 
-        match timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, from))) => break 'master (n, from),
+        match socket.rcv_from_timeout(&mut buf, Duration::from_millis(500)).await {
+            Ok(Ok((data, from))) => break 'master (data, from),
             Ok(Err(e)) => return Err(e.into()),
             Err(_elapsed) => {}
         }
@@ -1065,9 +1065,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     debug!("Master handshake sent, response received from {}", recv_addr);
 
-    buf.truncate(n);
-
-    let server_entries = match parse(&mut buf, Some(&mut *session), Some(recv_addr))? {
+    let server_entries = match parse(data, Some(&mut *session), Some(recv_addr))? {
         ParseOutcome::ServerList(servers) => servers,
         outcome => bail!("Expected the master handshake response, got {:?}", outcome),
     };
@@ -1113,12 +1111,11 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
         }
 
         loop {
-            match timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
-                Ok(Ok((n, from))) => {
-                    buf.truncate(n);
-                    debug!("Received {} bytes from {}", n, from);
+            match socket.rcv_from_timeout(&mut buf, Duration::from_millis(500)).await {
+                Ok(Ok((data, from))) => {
+                    debug!("Received {} bytes from {}", data.len(), from);
 
-                    match parse(&mut buf, Some(&mut *session), Some(from))? {
+                    match parse(data, Some(&mut *session), Some(from))? {
                         ParseOutcome::HandshakeResp {
                             keepalive_interval,
                         } => break 'connect (keepalive_interval, from),
@@ -1150,11 +1147,10 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
             debug!("Keepalive sent");
         }
 
-        match timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, from))) => {
-                buf.truncate(n);
-                debug!("Received {} bytes from {}", n, from);
-                parse(&mut buf, Some(&mut *session), Some(from))?;
+        match socket.rcv_from_timeout(&mut buf, Duration::from_millis(500)).await {
+            Ok(Ok((data, from))) => {
+                debug!("Received {} bytes from {}", data.len(), from);
+                parse(data, Some(&mut *session), Some(from))?;
             }
             Ok(Err(e)) => return Err(e.into()),
             Err(_elapsed) => {}
