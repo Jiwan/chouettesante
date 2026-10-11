@@ -446,14 +446,10 @@ fn make_hello_server(session: &IotcSession) -> Result<Vec<u8>> {
     Ok(packet)
 }
 
-fn make_record_send_p2p_keep_alive(peer: &P2PPeer) -> Result<Vec<u8>> {
+fn make_record_send_p2p_keep_alive(record_sid: u32) -> Result<Vec<u8>> {
     // From iotcRecordSendP2PKeepAlive in libIOTCAPIs.so: a completely
     // unencrypted type 5 record, 0x18 bytes total.
     const RECORD_SIZE: usize = 0xc;
-
-    let record_sid = peer
-        .record_sid
-        .context("Cannot send a keepalive before the peer record SID is known")?;
 
     let mut record = vec![0u8; constants::RECORD_HEADER_SIZE + RECORD_SIZE];
     let mut writer = Cursor::new(record.as_mut_slice());
@@ -472,13 +468,15 @@ fn make_record_send_p2p_keep_alive(peer: &P2PPeer) -> Result<Vec<u8>> {
 }
 
 // From the case '\x03' handler in iotcRecordHandler in libIOTCAPIs.so: the
-// response to the P2PInitHandshakeReq.
+// response to the P2PInitHandshakeReq. Pure parse: validates against the
+// session (nonce2, device uid) and the peer credentials, and returns the
+// facts for the state machines to apply.
 fn parse_record_p2p_init_handshake_resp(
     buffer: &[u8],
     record_size: usize,
-    session: &mut IotcSession,
+    session: &IotcSession,
     from: SocketAddr,
-) -> Result<u16> {
+) -> Result<(u32, u16)> {
     // Layout: header (aad) | payload | tag
     // Size:     0x0c         |   ...   | 0x10
     let aad = &buffer[0..constants::RECORD_HEADER_SIZE];
@@ -487,9 +485,9 @@ fn parse_record_p2p_init_handshake_resp(
     let tag =
         &buffer[constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE..];
 
-    let (nonce2, device_id) = (session.nonce2, session.device_id);
     let peer = session
-        .peer_mut(&from)
+        .peers
+        .get(&from)
         .with_context(|| format!("Handshake response from an unknown peer: {}", from))?;
 
     let packet = decrypt_aes_128_gcm(ciphertext, aad, tag, peer.aes_key, peer.aes_iv)?;
@@ -509,7 +507,7 @@ fn parse_record_p2p_init_handshake_resp(
     }
     let _ = reader.read_u8()?; // Version.
     let _ = reader.read_u8()?; // Flags.
-    let content_size = reader.read_le_u16()? as usize;
+    let _content_size = reader.read_le_u16()? as usize;
     let _ = reader.read_le_u16()?; // Unknown.
 
     let cmd_type = reader.read_le_u16()?;
@@ -522,7 +520,7 @@ fn parse_record_p2p_init_handshake_resp(
 
     let mut content = Cursor::new(&packet[PACKET_HEADER_SIZE..]);
     let nonce2_echo = content.read_le_u16()?;
-    if nonce2_echo != nonce2 {
+    if nonce2_echo != session.nonce2 {
         return Err(anyhow::anyhow!(
             "Wrong nonce2 in handshake response: 0x{:04x}",
             nonce2_echo
@@ -532,7 +530,7 @@ fn parse_record_p2p_init_handshake_resp(
     let _ = content.read_le_u16()?;
     let record_sid = content.read_le_u32()?;
     let uid = content.read_bytes::<20>()?;
-    if uid != device_id {
+    if uid != session.device_id {
         return Err(anyhow::anyhow!(
             "Wrong device id in handshake response: {:?}",
             uid
@@ -543,45 +541,25 @@ fn parse_record_p2p_init_handshake_resp(
     let keepalive_interval =
         Cursor::new(&packet[PACKET_HEADER_SIZE + 0x34..]).read_le_u16()?;
 
-    peer.record_sid = Some(record_sid);
-    session.state = SessionState::Connected;
-
     debug!(
-        "Handshake response accepted: record sid 0x{:08x}, keepalive interval {}s (content size 0x{:x})",
-        record_sid, keepalive_interval, content_size
+        "Handshake response accepted: record sid 0x{:08x}, keepalive interval {}s",
+        record_sid, keepalive_interval
     );
 
-    Ok(keepalive_interval)
+    Ok((record_sid, keepalive_interval))
 }
 
 // From the case '\x05' handler in iotcRecordHandler in libIOTCAPIs.so: the
-// server's keepalive, fully unencrypted.
-fn parse_record_keep_alive(
-    buffer: &[u8],
-    record_size: usize,
-    session: &IotcSession,
-    from: SocketAddr,
-) -> Result<()> {
+// server's keepalive, fully unencrypted. Pure parse: returns the echoed
+// record SID.
+fn parse_record_keep_alive(buffer: &[u8]) -> Result<u32> {
     let mut reader = Cursor::new(buffer);
     reader.set_position(constants::RECORD_HEADER_SIZE as u64);
     let record_sid = reader.read_le_u32()?;
 
-    let peer = session
-        .peers
-        .get(&from)
-        .with_context(|| format!("Keepalive from an unknown peer: {}", from))?;
+    debug!("Keepalive received (record sid 0x{:08x})", record_sid);
 
-    if Some(record_sid) != peer.record_sid {
-        return Err(anyhow::anyhow!(
-            "Keepalive from the wrong peer sid: 0x{:08x} vs {:?}",
-            record_sid,
-            peer.record_sid
-        ));
-    }
-
-    debug!("Keepalive received (record size 0x{:x})", record_size);
-
-    Ok(())
+    Ok(record_sid)
 }
 
 pub struct IotcSession {
@@ -595,24 +573,48 @@ pub struct IotcSession {
     // Mirrors Session.peers[0..0xb] in libIOTCAPIs.so: one set of P2P
     // credentials per server address.
     peers: HashMap<SocketAddr, P2PPeer>,
-    state: SessionState,
+    state: ConnectionState,
 }
 
 struct P2PPeer {
     aes_key: [u8; 16],
     aes_iv: [u8; 12],
-    // Learned from the type 3 handshake response (content offset 0x04) and
-    // echoed in every type 4/5 record from this peer. See FUN_0004d570.
-    record_sid: Option<u32>,
+    state: PeerState,
 }
 
-// Mirrors Session.field_0x740 in libIOTCAPIs.so.
+// Mirrors Session.field_0x740 in libIOTCAPIs.so: the main connection state
+// machine, owned by the session and driving the fan-out policy (which
+// servers to contact, when to retry, when the session is established).
 #[derive(Debug, PartialEq)]
-enum SessionState {
-    Connecting,
-    // Set when the type 3 P2PInitHandshakeResp is accepted (state 6 in the
-    // binary).
+enum ConnectionState {
+    // Master handshake records sent to every master address (state 1).
+    MasterHandshake,
+    // Master returned the P2P server candidates; HelloServer sent (state
+    // 2).
+    ServerDiscovery,
+    // P2P init handshake requests sent to every candidate (states 4-5).
+    P2PHandshaking,
+    // A P2P server accepted the handshake (state 6).
     Connected,
+}
+
+// Mirrors the per-server state in the Session server table (state byte at
+// +0x7e7) in libIOTCAPIs.so: one machine per server peer, tracking how the
+// rendezvous with the device progresses through that particular server.
+#[derive(Debug, PartialEq)]
+enum PeerState {
+    AwaitingHandshakeResp,
+    // The server reported the device as not connected there (cmd 0x227).
+    DeviceReportedOffline,
+    // The server reported the device as connected there (cmd 0x229).
+    DeviceReportedOnline,
+    // The type 3 handshake response was accepted: this peer carries the
+    // session from now on.
+    Connected {
+        record_sid: u32,
+        keepalive_interval: u16,
+        last_alive: Instant,
+    },
 }
 
 #[derive(Debug)]
@@ -643,7 +645,7 @@ impl IotcSession {
             nonce2,
             ecdh_key: generate_ecdh_key()?,
             peers: HashMap::new(),
-            state: SessionState::Connecting,
+            state: ConnectionState::MasterHandshake,
         })
     }
 
@@ -662,7 +664,11 @@ impl IotcSession {
             rand::fill(&mut aes_iv);
             self.peers.insert(
                 *address,
-                P2PPeer { aes_key, aes_iv, record_sid: None },
+                P2PPeer {
+                    aes_key,
+                    aes_iv,
+                    state: PeerState::AwaitingHandshakeResp,
+                },
             );
         }
 
@@ -671,6 +677,81 @@ impl IotcSession {
 
     fn peer_mut(&mut self, address: &SocketAddr) -> Option<&mut P2PPeer> {
         self.peers.get_mut(address)
+    }
+
+    // Applies a parsed wire fact to the two state machines: the session
+    // main state and the per-peer states. Parsing stays pure; this is
+    // where the transitions happen.
+    fn apply_outcome(&mut self, outcome: ParseOutcome, from: SocketAddr) {
+        match outcome {
+            ParseOutcome::HandshakeResp {
+                record_sid,
+                keepalive_interval,
+            } => {
+                if let Some(peer) = self.peer_mut(&from) {
+                    peer.state = PeerState::Connected {
+                        record_sid,
+                        keepalive_interval,
+                        last_alive: Instant::now(),
+                    };
+                    self.state = ConnectionState::Connected;
+                    debug!("Peer {} promoted to Connected", from);
+                } else {
+                    warn!("Handshake response from an unknown peer: {}", from);
+                }
+            }
+            ParseOutcome::KeepAlive { record_sid } => {
+                if let Some(peer) = self.peer_mut(&from) {
+                    match &mut peer.state {
+                        PeerState::Connected {
+                            record_sid: expected,
+                            last_alive,
+                            ..
+                        } if *expected == record_sid => {
+                            *last_alive = Instant::now();
+                        }
+                        PeerState::Connected { .. } => {
+                            warn!("Keepalive from {} with a wrong record sid", from);
+                        }
+                        _ => {
+                            warn!("Keepalive from {} before the handshake completed", from);
+                        }
+                    }
+                }
+            }
+            ParseOutcome::DeviceStatus { online, uid } => {
+                if uid == self.device_id {
+                    if let Some(peer) = self.peer_mut(&from) {
+                        if !matches!(peer.state, PeerState::Connected { .. }) {
+                            peer.state = if online {
+                                PeerState::DeviceReportedOnline
+                            } else {
+                                PeerState::DeviceReportedOffline
+                            };
+                        }
+                    }
+                } else {
+                    debug!("Device status for another device: {:?}", uid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // The peer carrying the session, if any.
+    fn connected_peer(&self) -> Option<(&SocketAddr, &P2PPeer)> {
+        self.peers
+            .iter()
+            .find(|(_, peer)| matches!(peer.state, PeerState::Connected { .. }))
+    }
+
+    // Whether every known peer reports the device as offline there.
+    fn device_offline_everywhere(&self) -> bool {
+        !self.peers.is_empty()
+            && self
+                .peers
+                .values()
+                .all(|p| matches!(p.state, PeerState::DeviceReportedOffline))
     }
 }
 
@@ -703,7 +784,17 @@ impl IotcSessionManager {
     }
 }
 
-pub fn parse_packet(buffer: &[u8]) -> Result<()> {
+// The parsed facts of a standalone packet (not wrapped in a record), from
+// _IOTC_Packet_Handler in libIOTCAPIs.so. Parsing stays pure: the state
+// machines apply these facts.
+#[derive(Debug, PartialEq)]
+enum PacketOutcome {
+    HelloClient { address: SocketAddr },
+    DeviceStatus { online: bool, uid: [u8; 20] },
+    Ignored,
+}
+
+pub fn parse_packet(buffer: &[u8]) -> Result<PacketOutcome> {
     let buffer_len = buffer.len();
     let (header, content) = buffer
         .split_at_checked(PACKET_HEADER_SIZE)
@@ -745,7 +836,7 @@ pub fn parse_packet(buffer: &[u8]) -> Result<()> {
             PACKET_HEADER_SIZE,
             buffer_len
         );
-        return Ok(());
+        return Ok(PacketOutcome::Ignored);
     }
 
     // When the CypherExtendHeaderOnly flag is set, only the first 0x30
@@ -762,16 +853,17 @@ pub fn parse_packet(buffer: &[u8]) -> Result<()> {
     decypher(&mut content[..cyphered_size]);
 
     // From: _IOTC_Packet_Handler in libIOTCAPIs.so
-    let cmd_type_enum = CmdType::try_from(cmd_type);
-
-    if cmd_type_enum.is_err() {
-        warn!("Unknown cmd type: 0x{:04x}", cmd_type);
-        return Ok(());
-    }
+    let cmd_type_enum = match CmdType::try_from(cmd_type) {
+        Ok(cmd) => cmd,
+        Err(_) => {
+            warn!("Unknown cmd type: 0x{:04x}", cmd_type);
+            return Ok(PacketOutcome::Ignored);
+        }
+    };
 
     let mut reader: Cursor<&[u8]> = Cursor::new(content.as_slice());
 
-    match cmd_type_enum.unwrap() {
+    match cmd_type_enum {
         CmdType::UnknownCmd0x408 => {
             if packet_flags.contains(PacketFlags::UnknownFlag0x4) {
                 return Err(ParseError::InvalidCypheredContentSize.into());
@@ -816,35 +908,36 @@ pub fn parse_packet(buffer: &[u8]) -> Result<()> {
         CmdType::P2PHandshake | CmdType::KeyPush => {
             debug!("Received P2P session packet");
         }
-        CmdType::DeviceOfflineStatus => {
-            // From _IOTC_Packet_Handler: the content is the 20-byte device
-            // uid; the server reports the device as not connected there.
+        CmdType::DeviceOfflineStatus | CmdType::DeviceOnlineStatus => {
+            // From _IOTC_Packet_Handler: the content starts with the
+            // 20-byte device uid; 0x227 reports the device as not
+            // connected to this server, 0x229 as connected.
             if content.len() >= 20 {
-                let uid = &content[..20];
-                debug!("Device {:?} reported offline by this server", uid);
+                let online = cmd_type == CmdType::DeviceOnlineStatus as u16;
+                let uid: [u8; 20] = content[..20].try_into().unwrap();
+                return Ok(PacketOutcome::DeviceStatus { online, uid });
             }
-        }
-        CmdType::DeviceOnlineStatus => {
-            debug!("Device online status packet received");
         }
         CmdType::HelloServer => {
             debug!("Received HelloServer packet");
         }
         CmdType::HelloClient => {
-            // addNatRecord in libIOTCAPIs.so
-            {
+            // From addNatRecord in libIOTCAPIs.so: a sockaddr_in followed
+            // by 8 unknown bytes, carrying our public address as seen by
+            // the server.
+            if content.len() >= 16 {
                 let _ = reader.read_le_u16()?; // Probably the af type?
-                let our_port = reader.read_be_u16()?;
-                let our_address: u32 = reader.read_be_u32()?;
-                let our_address = IpAddr::V4(Ipv4Addr::from_bits(our_address));
+                let port = reader.read_be_u16()?;
+                let address: u32 = reader.read_be_u32()?;
+                let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::from_bits(address)), port);
                 let _ = reader.read_le_u64()?; // unknown
 
-                debug!("Client IP address: {}:{}", our_address, our_port);
+                return Ok(PacketOutcome::HelloClient { address });
             }
         }
     }
 
-    Ok(())
+    Ok(PacketOutcome::Ignored)
 }
 
 fn parse_record_handshake<T>(
@@ -943,15 +1036,27 @@ where
 #[derive(Debug)]
 pub enum ParseOutcome {
     ServerList(Vec<ServerEntry>),
-    HandshakeResp { keepalive_interval: u16 },
-    KeepAlive,
+    HandshakeResp {
+        record_sid: u32,
+        keepalive_interval: u16,
+    },
+    KeepAlive {
+        record_sid: u32,
+    },
+    DeviceStatus {
+        online: bool,
+        uid: [u8; 20],
+    },
+    HelloClient {
+        address: SocketAddr,
+    },
     Packet,
     Other,
 }
 
 pub fn parse(
     buffer: &[u8],
-    session: Option<&mut IotcSession>,
+    session: Option<&IotcSession>,
     from: Option<SocketAddr>,
 ) -> Result<ParseOutcome> {
     // From iotcRecordHandler in libIOTCAPIs.so / handle_buffer
@@ -960,8 +1065,13 @@ pub fn parse(
 
     if record_magic_number != constants::RECORD_MAGIC_NUMBER {
         // Process as packet
-        parse_packet(buffer)?;
-        return Ok(ParseOutcome::Packet);
+        return match parse_packet(buffer)? {
+            PacketOutcome::HelloClient { address } => Ok(ParseOutcome::HelloClient { address }),
+            PacketOutcome::DeviceStatus { online, uid } => {
+                Ok(ParseOutcome::DeviceStatus { online, uid })
+            }
+            PacketOutcome::Ignored => Ok(ParseOutcome::Packet),
+        };
     }
 
     // Process as record
@@ -981,25 +1091,23 @@ pub fn parse(
 
     match record_type {
         RecordType::MasterHandshake => {
-            let servers = parse_record_handshake(&buffer, &mut cursor, session)?;
+            let servers = parse_record_handshake(buffer, &mut cursor, session)?;
             Ok(ParseOutcome::ServerList(servers))
         }
         RecordType::P2PInitHandshakeResp => {
             let Some(from) = from else {
                 bail!("Received a handshake response without a source address");
             };
-            let keepalive_interval =
-                parse_record_p2p_init_handshake_resp(&buffer, record_size, session, from)?;
+            let (record_sid, keepalive_interval) =
+                parse_record_p2p_init_handshake_resp(buffer, record_size, session, from)?;
             Ok(ParseOutcome::HandshakeResp {
+                record_sid,
                 keepalive_interval,
             })
         }
         RecordType::KeepAlive => {
-            let Some(from) = from else {
-                bail!("Received a keepalive without a source address");
-            };
-            parse_record_keep_alive(&buffer, record_size, session, from)?;
-            Ok(ParseOutcome::KeepAlive)
+            let record_sid = parse_record_keep_alive(buffer)?;
+            Ok(ParseOutcome::KeepAlive { record_sid })
         }
         RecordType::KeyPush => {
             // TODO: Reverse the type 4 record (cmd 0x30d) further: per-peer
@@ -1065,10 +1173,12 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     debug!("Master handshake sent, response received from {}", recv_addr);
 
-    let server_entries = match parse(data, Some(&mut *session), Some(recv_addr))? {
+    let server_entries = match parse(data, Some(&*session), Some(recv_addr))? {
         ParseOutcome::ServerList(servers) => servers,
         outcome => bail!("Expected the master handshake response, got {:?}", outcome),
     };
+
+    session.state = ConnectionState::ServerDiscovery;
 
     debug!(
         "Master returned {} P2P server candidates",
@@ -1086,7 +1196,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     // From AddUDPPreCheckTask: the P2P init handshake request goes to every
     // candidate, and is resent every 500ms until a response or a 60s
-    // timeout (FUN_00037d90).
+    // timeout (FUN_00037d90). Each peer starts in AwaitingHandshakeResp.
     let handshake_records: Vec<(SocketAddr, Vec<u8>)> = server_entries
         .iter()
         .map(|server_entry| {
@@ -1098,10 +1208,13 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
         })
         .collect::<Result<_>>()?;
 
+    session.state = ConnectionState::P2PHandshaking;
+
     let connect_deadline = Instant::now() + Duration::from_secs(60);
     let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
+    let mut offline_everywhere_reported = false;
 
-    let (keepalive_interval, connected_addr) = 'connect: loop {
+    'connect: loop {
         if Instant::now() > connect_deadline {
             bail!("Timed out waiting for the P2P handshake response");
         }
@@ -1115,23 +1228,42 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
                 Ok(Ok((data, from))) => {
                     debug!("Received {} bytes from {}", data.len(), from);
 
-                    match parse(data, Some(&mut *session), Some(from))? {
-                        ParseOutcome::HandshakeResp {
-                            keepalive_interval,
-                        } => break 'connect (keepalive_interval, from),
-                        _ => continue,
+                    let outcome = parse(data, Some(&*session), Some(from))?;
+                    session.apply_outcome(outcome, from);
+
+                    if session.device_offline_everywhere() && !offline_everywhere_reported {
+                        offline_everywhere_reported = true;
+                        warn!(
+                            "The device is reported offline by all {} P2P servers",
+                            session.peers.len()
+                        );
+                    }
+
+                    if session.state == ConnectionState::Connected {
+                        break 'connect;
                     }
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_elapsed) => break, // 500ms without a response: resend.
             }
         }
-    };
+    }
 
-    debug!("Connected to P2P server {}", connected_addr);
+    let (connected_addr, record_sid, keepalive_interval) = match session.connected_peer() {
+        Some((addr, peer)) => match peer.state {
+            PeerState::Connected {
+                record_sid,
+                keepalive_interval,
+                ..
+            } => (*addr, record_sid, keepalive_interval),
+            _ => unreachable!("connected_peer returned a non-connected peer"),
+        },
+        None => unreachable!("The session is Connected but no peer carries it"),
+    };
 
     // From iotcRecordSendP2PKeepAlive: unencrypted type 5 records at the
     // server-provided interval (in seconds, from the handshake response).
+    let keepalive_record = make_record_send_p2p_keep_alive(record_sid)?;
     let keepalive_period = Duration::from_secs(keepalive_interval.max(1) as u64);
     let mut last_keepalive = Instant::now();
     let observe_until = Instant::now() + Duration::from_secs(30);
@@ -1140,9 +1272,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     loop {
         if last_keepalive.elapsed() >= keepalive_period {
-            let peer = session.peers.get(&connected_addr).unwrap();
-            let record = make_record_send_p2p_keep_alive(peer)?;
-            socket.send_to(&record, connected_addr).await?;
+            socket.send_to(&keepalive_record, connected_addr).await?;
             last_keepalive = Instant::now();
             debug!("Keepalive sent");
         }
@@ -1150,7 +1280,9 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
         match socket.rcv_from_timeout(&mut buf, Duration::from_millis(500)).await {
             Ok(Ok((data, from))) => {
                 debug!("Received {} bytes from {}", data.len(), from);
-                parse(data, Some(&mut *session), Some(from))?;
+
+                let outcome = parse(data, Some(&*session), Some(from))?;
+                session.apply_outcome(outcome, from);
             }
             Ok(Err(e)) => return Err(e.into()),
             Err(_elapsed) => {}
@@ -1195,6 +1327,61 @@ mod packet_writer_tests {
         let peer_b = session.get_or_create_peer(&addr_b, &pub_b).unwrap();
         assert_ne!(key_a, peer_b.aes_key);
         assert_ne!(iv_a, peer_b.aes_iv);
+    }
+
+    #[test]
+    fn device_status_packet_flips_the_peer_state() {
+        let mut session = IotcSession::new(1, "ABCDEFGHIJKLMNOPQRST").unwrap();
+        let addr = SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 1111));
+        let pub_key = test_public_key().unwrap();
+        session.get_or_create_peer(&addr, &pub_key).unwrap();
+
+        // A cmd 0x227 packet as the servers send it: the whole datagram
+        // charlie-cyphered, content = the 20-byte device uid.
+        let mut packet = vec![0u8; PACKET_HEADER_SIZE + 20];
+        let mut writer = Cursor::new(packet.as_mut_slice());
+        write_packet(
+            &mut writer,
+            PacketHeader {
+                command: CmdType::DeviceOfflineStatus as u16,
+                channel_id: 0,
+                flags: 0,
+                command_options: 0,
+                session_id: 0,
+                channel_flags: 0,
+            },
+            |writer| {
+                writer.write_bytes(&session.device_id)?;
+                Ok(())
+            },
+            20,
+        )
+        .unwrap();
+        charlie_cypher::cypher(&mut packet);
+
+        let outcome = parse_packet(&packet).unwrap();
+        assert_eq!(
+            outcome,
+            PacketOutcome::DeviceStatus {
+                online: false,
+                uid: session.device_id
+            }
+        );
+
+        // The state machines apply the fact to the right peer.
+        session.apply_outcome(
+            ParseOutcome::DeviceStatus {
+                online: false,
+                uid: session.device_id,
+            },
+            addr,
+        );
+        assert_eq!(
+            session.peers[&addr].state,
+            PeerState::DeviceReportedOffline
+        );
+        assert!(session.device_offline_everywhere());
+        assert_eq!(session.state, ConnectionState::MasterHandshake);
     }
 
     #[test]
