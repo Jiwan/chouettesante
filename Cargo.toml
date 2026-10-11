@@ -19,4 +19,6 @@ openssl = "0.10"
 
 [lib]
 name="chouettesante"
-crate-type = ["cdylib"]
+# cdylib: linked by the Wireshark dissector (charlie_cypher/charlie_decypher).
+# rlib: linked by the chouettesante binary target.
+crate-type = ["cdylib", "rlib"]
