@@ -630,11 +630,11 @@ enum ConnectionEvent<'a> {
     Tick,
 }
 
-// The main machine's outputs: what to put on the wire, with the records
-// crafted last minute by the machine itself.
+// The main machine's outputs: one datagram to put on the wire per action,
+// or the end of the connection observation. The records are crafted last
+// minute by the machine itself.
 #[derive(Debug)]
 enum ConnectionAction {
-    SendToAll { data: Vec<u8>, addrs: Vec<SocketAddr> },
     Send { data: Vec<u8>, to: SocketAddr },
     Finished,
 }
@@ -642,9 +642,7 @@ enum ConnectionAction {
 impl ConnectionAction {
     fn data(&self) -> &[u8] {
         match self {
-            ConnectionAction::SendToAll { data, .. } | ConnectionAction::Send { data, .. } => {
-                data
-            }
+            ConnectionAction::Send { data, .. } => data,
             ConnectionAction::Finished => &[],
         }
     }
@@ -764,10 +762,12 @@ impl IotcSession {
                     bail!("Timed out waiting for the master handshake response");
                 }
 
-                Ok(vec![ConnectionAction::SendToAll {
-                    data: make_record_send_master_handshake(self)?,
-                    addrs,
-                }])
+                let data = make_record_send_master_handshake(self)?;
+
+                Ok(addrs
+                    .into_iter()
+                    .map(|to| ConnectionAction::Send { data: data.clone(), to })
+                    .collect())
             }
 
             ConnectionState::P2PHandshaking { servers, deadline, .. } => {
@@ -868,18 +868,27 @@ impl IotcSession {
 
         debug!("Master returned {} P2P server candidates", servers.len());
 
-        let mut actions = vec![ConnectionAction::SendToAll {
-            data: make_hello_server(self)?,
-            addrs: servers
-                .iter()
-                .map(|server| SocketAddr::from((server.ip_address, server.port)))
-                .collect(),
-        }];
+        let addrs: Vec<SocketAddr> = servers
+            .iter()
+            .map(|server| SocketAddr::from((server.ip_address, server.port)))
+            .collect();
 
-        for server in &servers {
+        // Entry actions: one hello packet per candidate (the same packet,
+        // so it is crafted once and cloned), then one handshake record per
+        // candidate, which also creates the peers.
+        let hello_packet = make_hello_server(self)?;
+        let mut actions: Vec<ConnectionAction> = addrs
+            .iter()
+            .map(|to| ConnectionAction::Send {
+                data: hello_packet.clone(),
+                to: *to,
+            })
+            .collect();
+
+        for (server, to) in servers.iter().zip(addrs) {
             actions.push(ConnectionAction::Send {
                 data: make_record_send_p2p_init_handshake_req(self, server)?,
-                to: SocketAddr::from((server.ip_address, server.port)),
+                to,
             });
         }
 
@@ -1369,11 +1378,7 @@ pub fn parse(
 }
 
 pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
-    // From IOTC_Connect_UDP_Inner in libIOTCAPIs.so: a thin driver that
-    // feeds datagrams and 500ms ticks to the connection state machine and
-    // performs the actions it returns. All the sequencing (what to send,
-    // when to retry, when the session is established, when to give up)
-    // lives in ConnectionState; this function only does I/O.
+    // From IOTC_Connect_UDP_Inner in libIOTCAPIs.so.
 
     let mut session_manager = IotcSessionManager::new();
     let session = session_manager.create_session(uid);
@@ -1398,7 +1403,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     session.start_connection(master_addrs);
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
+    let mut reception_buffer = vec![0; constants::RECORD_PACKET_MAX_SIZE];
 
     // Entry action of the MasterHandshake state: contact the masters right
     // away instead of waiting for the first tick.
@@ -1407,6 +1412,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     loop {
         for action in actions {
             if matches!(action, ConnectionAction::Finished) {
+                debug!("Connection finished, exiting loop");
                 return Ok(());
             }
 
@@ -1414,7 +1420,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
         }
 
         // One event per iteration: a datagram, or a 500ms tick.
-        actions = match socket.rcv_from_timeout(&mut buf, Duration::from_millis(500)).await {
+        actions = match socket.rcv_from_timeout(&mut reception_buffer, Duration::from_millis(500)).await {
             Ok(Ok((data, from))) => {
                 debug!("Received {} bytes from {}", data.len(), from);
                 session.handle_event(ConnectionEvent::Datagram { data, from })?
@@ -1429,11 +1435,6 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 // machine crafts the records; this only does I/O.
 async fn perform_action(socket: &UdpSocket, action: ConnectionAction) -> Result<()> {
     match action {
-        ConnectionAction::SendToAll { data, addrs } => {
-            for addr in addrs {
-                socket.send_to(&data, addr).await?;
-            }
-        }
         ConnectionAction::Send { data, to } => {
             socket.send_to(&data, to).await?;
         }
@@ -1545,11 +1546,11 @@ mod packet_writer_tests {
         ));
 
         // On a tick, the machine crafts the master record last minute and
-        // fans it out to every master address.
+        // sends it to every master address.
         let actions = session.on_tick().unwrap();
         assert!(matches!(
             actions.as_slice(),
-            [ConnectionAction::SendToAll { addrs, .. }] if addrs == &vec![master_addr]
+            [ConnectionAction::Send { ref to, .. }] if to == &master_addr
         ));
         assert_eq!(
             actions[0].data().len(),
@@ -1566,16 +1567,17 @@ mod packet_writer_tests {
         };
         let peer_addr = SocketAddr::from((Ipv4Addr::new(5, 6, 7, 8), 3478));
         let actions = session.enter_p2p_handshaking(vec![entry]).unwrap();
-        // The hello to every candidate, then one handshake record per
-        // candidate.
+        // One hello per candidate, then one handshake record per candidate.
+        assert_eq!(actions.len(), 2);
         assert!(matches!(
             actions[0],
-            ConnectionAction::SendToAll { ref addrs, .. } if addrs == &vec![peer_addr]
+            ConnectionAction::Send { ref to, .. } if to == &peer_addr
         ));
         assert!(matches!(
             actions[1],
             ConnectionAction::Send { ref to, .. } if to == &peer_addr
         ));
+        assert_eq!(actions[0].data().len(), 0x18);
         assert_eq!(actions[1].data().len(), constants::RECORD_HEADER_SIZE + 0xac);
         assert!(matches!(session.state, ConnectionState::P2PHandshaking { .. }));
         assert_eq!(session.peers.len(), 1);
