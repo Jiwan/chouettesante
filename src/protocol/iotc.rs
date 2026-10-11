@@ -573,8 +573,8 @@ pub struct IotcSession {
     // Mirrors Session.peers[0..0xb] in libIOTCAPIs.so: one set of P2P
     // credentials per server address.
     peers: HashMap<SocketAddr, P2PPeer>,
-    // The main connection state machine and its wire buffers.
-    connection: Connection,
+    // The main connection state machine, mirroring Session.field_0x740.
+    state: ConnectionState,
     // Our public address as seen by the P2P servers, from addNatRecord.
     public_address: Option<SocketAddr>,
 }
@@ -589,71 +589,63 @@ struct P2PPeer {
 // machine. It does not run any I/O itself: connect() feeds it events and
 // performs the returned actions, so every transition (and its entry
 // actions, like the fan-outs) is driven by the current state rather than
-// by the order of statements in connect().
-#[derive(Debug, PartialEq)]
+// by the order of statements in connect(). Each variant carries the data
+// that matters in that state; the wire records are never stored, they are
+// crafted from the session right before sending.
+#[derive(Debug, Clone)]
 enum ConnectionState {
     Idle,
-    // Master handshake records sent to every master address (state 1).
-    MasterHandshake { deadline: Instant },
-    // P2P init handshake requests sent to every candidate (states 4-5).
-    // The binary's states 2-4 (hello/pre-session wait) are folded into the
-    // MasterHandshake -> P2PHandshaking transition since we do not
-    // implement the pre-session wait.
-    P2PHandshaking { deadline: Instant },
-    // A P2P server accepted the handshake (state 6).
-    Connected { peer: SocketAddr },
+    // Master handshake records resent to every master address on each tick
+    // until one answers (state 1).
+    MasterHandshake {
+        addrs: Vec<SocketAddr>,
+        deadline: Instant,
+    },
+    // P2P init handshake requests resent to every candidate on each tick
+    // (states 4-5). The binary's states 2-4 (hello/pre-session wait) are
+    // folded into the MasterHandshake -> P2PHandshaking transition since we
+    // do not implement the pre-session wait.
+    P2PHandshaking {
+        servers: Vec<ServerEntry>,
+        deadline: Instant,
+        offline_warning_sent: bool,
+    },
+    // One peer carries the session; unencrypted keepalives at the
+    // server-provided interval (state 6).
+    Connected {
+        peer: SocketAddr,
+        record_sid: u32,
+        keepalive_period: Duration,
+        next_keepalive: Instant,
+        // Observe the connected session for 30s for now; becomes "forever"
+        // once the data channels are implemented.
+        observe_until: Instant,
+    },
 }
 
-// The main machine's inputs and outputs: events in (datagrams and timer
-// ticks), actions out (what to put on the wire).
+// The main machine's inputs: datagrams and timer ticks.
 #[derive(Debug)]
 enum ConnectionEvent<'a> {
     Datagram { data: &'a [u8], from: SocketAddr },
     Tick,
 }
 
-#[derive(Debug, PartialEq)]
+// The main machine's outputs: what to put on the wire, with the records
+// crafted last minute by the machine itself.
+#[derive(Debug)]
 enum ConnectionAction {
-    SendMasterHandshake,
-    SendHelloServer,
-    SendP2PInitHandshake,
-    SendKeepAlive,
+    SendToAll { data: Vec<u8>, addrs: Vec<SocketAddr> },
+    Send { data: Vec<u8>, to: SocketAddr },
     Finished,
 }
 
-// The state and buffers of the main connection machine.
-#[derive(Debug)]
-struct Connection {
-    state: ConnectionState,
-    master_addrs: Vec<SocketAddr>,
-    master_record: Vec<u8>,
-    // Filled when the master returns its P2P server candidates.
-    server_entries: Vec<ServerEntry>,
-    hello_packet: Vec<u8>,
-    handshake_records: Vec<(SocketAddr, Vec<u8>)>,
-    keepalive: Option<(SocketAddr, Vec<u8>)>,
-    keepalive_period: Duration,
-    last_keepalive: Instant,
-    // For now, observe the connected session for 30s before finishing.
-    // This becomes "forever" once the data channels are implemented.
-    observe_until: Instant,
-    offline_reported: bool,
-}
-
-impl Connection {
-    fn idle() -> Self {
-        Self {
-            state: ConnectionState::Idle,
-            master_addrs: Vec::new(),
-            master_record: Vec::new(),
-            server_entries: Vec::new(),
-            hello_packet: Vec::new(),
-            handshake_records: Vec::new(),
-            keepalive: None,
-            keepalive_period: Duration::from_secs(1),
-            last_keepalive: Instant::now(),
-            observe_until: Instant::now(),
-            offline_reported: false,
+impl ConnectionAction {
+    fn data(&self) -> &[u8] {
+        match self {
+            ConnectionAction::SendToAll { data, .. } | ConnectionAction::Send { data, .. } => {
+                data
+            }
+            ConnectionAction::Finished => &[],
         }
     }
 }
@@ -677,7 +669,7 @@ enum PeerState {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ServerEntry {
     ip_address: IpAddr,
     port: u16,
@@ -705,7 +697,7 @@ impl IotcSession {
             nonce2,
             ecdh_key: generate_ecdh_key()?,
             peers: HashMap::new(),
-            connection: Connection::idle(),
+            state: ConnectionState::Idle,
             public_address: None,
         })
     }
@@ -750,39 +742,75 @@ impl IotcSession {
         }
     }
 
-    // Starts the connection machine: the master handshake will be resent to
-    // every address on every tick until one answers.
-    fn start_connection(&mut self, master_addrs: Vec<SocketAddr>, master_record: Vec<u8>) {
-        self.connection.state = ConnectionState::MasterHandshake {
+    // Starts the connection machine: the master handshake will be crafted
+    // and resent to every address on each tick until one answers.
+    fn start_connection(&mut self, master_addrs: Vec<SocketAddr>) {
+        self.state = ConnectionState::MasterHandshake {
+            addrs: master_addrs,
             deadline: Instant::now() + Duration::from_secs(60),
         };
-        self.connection.master_addrs = master_addrs;
-        self.connection.master_record = master_record;
     }
 
     fn on_tick(&mut self) -> Result<Vec<ConnectionAction>> {
-        match self.connection.state {
+        let now = Instant::now();
+
+        // Match on a clone so the records can be crafted through &mut self
+        // without holding a borrow on the state.
+        match self.state.clone() {
             ConnectionState::Idle => Ok(vec![]),
-            ConnectionState::MasterHandshake { deadline } => {
-                if Instant::now() > deadline {
+
+            ConnectionState::MasterHandshake { addrs, deadline } => {
+                if now > deadline {
                     bail!("Timed out waiting for the master handshake response");
                 }
-                Ok(vec![ConnectionAction::SendMasterHandshake])
+
+                Ok(vec![ConnectionAction::SendToAll {
+                    data: make_record_send_master_handshake(self)?,
+                    addrs,
+                }])
             }
-            ConnectionState::P2PHandshaking { deadline } => {
-                if Instant::now() > deadline {
+
+            ConnectionState::P2PHandshaking { servers, deadline, .. } => {
+                if now > deadline {
                     bail!("Timed out waiting for the P2P handshake response");
                 }
-                Ok(vec![ConnectionAction::SendP2PInitHandshake])
+
+                // One record per candidate; this also creates the peers on
+                // the first pass (their credentials are cached afterwards).
+                servers
+                    .iter()
+                    .map(|server| {
+                        Ok(ConnectionAction::Send {
+                            data: make_record_send_p2p_init_handshake_req(self, server)?,
+                            to: SocketAddr::from((server.ip_address, server.port)),
+                        })
+                    })
+                    .collect()
             }
-            ConnectionState::Connected { .. } => {
-                if Instant::now() > self.connection.observe_until {
+
+            ConnectionState::Connected {
+                peer,
+                record_sid,
+                keepalive_period,
+                next_keepalive,
+                observe_until,
+            } => {
+                if now > observe_until {
                     return Ok(vec![ConnectionAction::Finished]);
                 }
 
-                if self.connection.last_keepalive.elapsed() >= self.connection.keepalive_period {
-                    self.connection.last_keepalive = Instant::now();
-                    return Ok(vec![ConnectionAction::SendKeepAlive]);
+                if now >= next_keepalive {
+                    if let ConnectionState::Connected {
+                        next_keepalive, ..
+                    } = &mut self.state
+                    {
+                        *next_keepalive = now + keepalive_period;
+                    }
+
+                    return Ok(vec![ConnectionAction::Send {
+                        data: make_record_send_p2p_keep_alive(record_sid)?,
+                        to: peer,
+                    }]);
                 }
 
                 Ok(vec![])
@@ -799,95 +827,103 @@ impl IotcSession {
             ParseOutcome::HandshakeResp {
                 record_sid,
                 keepalive_interval,
-            } => self.enter_connected(from, record_sid, keepalive_interval),
+            } => Ok(self.enter_connected(from, record_sid, keepalive_interval)),
             ParseOutcome::DeviceStatus { .. } => {
                 // One aggregated warning once every peer reports the device
                 // as offline there.
-                if self.device_offline_everywhere() && !self.connection.offline_reported {
-                    self.connection.offline_reported = true;
-                    warn!(
-                        "The device is reported offline by all {} P2P servers",
-                        self.peers.len()
-                    );
+                let device_offline_everywhere = self.device_offline_everywhere();
+
+                if let ConnectionState::P2PHandshaking {
+                    offline_warning_sent,
+                    ..
+                } = &mut self.state
+                {
+                    if device_offline_everywhere && !*offline_warning_sent {
+                        *offline_warning_sent = true;
+                        warn!(
+                            "The device is reported offline by all {} P2P servers",
+                            self.peers.len()
+                        );
+                    }
                 }
+
                 Ok(vec![])
             }
             _ => Ok(vec![]),
         }
     }
 
-    // MasterHandshake -> P2PHandshaking: create the peers (each starting
-    // in AwaitingHandshakeResp), build the hello and handshake records and
-    // send them all. Those are the entry actions of the new state.
+    // MasterHandshake -> P2PHandshaking: the entry actions send a hello and
+    // a handshake request to every candidate. Crafting the handshake
+    // records also creates the peers, each starting in
+    // AwaitingHandshakeResp.
     fn enter_p2p_handshaking(
         &mut self,
         servers: Vec<ServerEntry>,
     ) -> Result<Vec<ConnectionAction>> {
-        if !matches!(
-            self.connection.state,
-            ConnectionState::MasterHandshake { .. }
-        ) {
+        if !matches!(self.state, ConnectionState::MasterHandshake { .. }) {
             debug!("Ignoring a duplicate master handshake response");
             return Ok(vec![]);
         }
 
         debug!("Master returned {} P2P server candidates", servers.len());
 
-        // The handshake records creation also creates the peers.
-        let handshake_records: Vec<(SocketAddr, Vec<u8>)> = servers
-            .iter()
-            .map(|server_entry| {
-                let addr = SocketAddr::from((server_entry.ip_address, server_entry.port));
-                Ok((
-                    addr,
-                    make_record_send_p2p_init_handshake_req(self, server_entry)?,
-                ))
-            })
-            .collect::<Result<_>>()?;
+        let mut actions = vec![ConnectionAction::SendToAll {
+            data: make_hello_server(self)?,
+            addrs: servers
+                .iter()
+                .map(|server| SocketAddr::from((server.ip_address, server.port)))
+                .collect(),
+        }];
 
-        self.connection.hello_packet = make_hello_server(self)?;
-        self.connection.server_entries = servers;
-        self.connection.handshake_records = handshake_records;
-        self.connection.state = ConnectionState::P2PHandshaking {
+        for server in &servers {
+            actions.push(ConnectionAction::Send {
+                data: make_record_send_p2p_init_handshake_req(self, server)?,
+                to: SocketAddr::from((server.ip_address, server.port)),
+            });
+        }
+
+        self.state = ConnectionState::P2PHandshaking {
+            servers,
             deadline: Instant::now() + Duration::from_secs(60),
+            offline_warning_sent: false,
         };
 
-        Ok(vec![
-            ConnectionAction::SendHelloServer,
-            ConnectionAction::SendP2PInitHandshake,
-        ])
+        Ok(actions)
     }
 
     // P2PHandshaking -> Connected: this peer carries the session from now
-    // on; keepalives start on the next tick.
+    // on; keepalives start at the server-provided interval.
     fn enter_connected(
         &mut self,
         peer: SocketAddr,
         record_sid: u32,
         keepalive_interval: u16,
-    ) -> Result<Vec<ConnectionAction>> {
-        let ConnectionState::P2PHandshaking { .. } = self.connection.state else {
-            return Ok(vec![]);
-        };
+    ) -> Vec<ConnectionAction> {
+        if !matches!(self.state, ConnectionState::P2PHandshaking { .. }) {
+            return vec![];
+        }
 
         // The per-peer machine must have promoted this peer already.
         if !matches!(
             self.peers.get(&peer).map(|p| &p.state),
             Some(PeerState::Connected { .. })
         ) {
-            return Ok(vec![]);
+            return vec![];
         }
 
         debug!("Connected to P2P server {}", peer);
 
-        self.connection.keepalive = Some((peer, make_record_send_p2p_keep_alive(record_sid)?));
-        self.connection.keepalive_period =
-            Duration::from_secs(keepalive_interval.max(1) as u64);
-        self.connection.last_keepalive = Instant::now();
-        self.connection.observe_until = Instant::now() + Duration::from_secs(30);
-        self.connection.state = ConnectionState::Connected { peer };
+        let keepalive_period = Duration::from_secs(keepalive_interval.max(1) as u64);
+        self.state = ConnectionState::Connected {
+            peer,
+            record_sid,
+            keepalive_period,
+            next_keepalive: Instant::now() + keepalive_period,
+            observe_until: Instant::now() + Duration::from_secs(30),
+        };
 
-        Ok(vec![])
+        vec![]
     }
 
     // Applies a parsed wire fact to the per-peer state machines. The main
@@ -1359,71 +1395,49 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     debug!("Master addresses: {:?}", master_addrs);
 
-    session.start_connection(master_addrs, make_record_send_master_handshake(session)?);
+    session.start_connection(master_addrs);
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let mut buf = vec![0; constants::RECORD_PACKET_MAX_SIZE];
 
     // Entry action of the MasterHandshake state: contact the masters right
     // away instead of waiting for the first tick.
-    perform_actions(&socket, session, &[ConnectionAction::SendMasterHandshake]).await?;
+    let mut actions = session.on_tick()?;
 
     loop {
+        for action in actions {
+            if matches!(action, ConnectionAction::Finished) {
+                return Ok(());
+            }
+
+            perform_action(&socket, action).await?;
+        }
+
         // One event per iteration: a datagram, or a 500ms tick.
-        let actions = match socket.rcv_from_timeout(&mut buf, Duration::from_millis(500)).await {
+        actions = match socket.rcv_from_timeout(&mut buf, Duration::from_millis(500)).await {
             Ok(Ok((data, from))) => {
                 debug!("Received {} bytes from {}", data.len(), from);
                 session.handle_event(ConnectionEvent::Datagram { data, from })?
             }
             Ok(Err(e)) => return Err(e.into()),
-            Err(_elapsed) => session.handle_event(ConnectionEvent::Tick)?,
+            Err(_elapsed) => session.on_tick()?,
         };
-
-        perform_actions(&socket, session, &actions).await?;
-
-        if actions.contains(&ConnectionAction::Finished) {
-            break;
-        }
     }
-
-    Ok(())
 }
 
-// Puts the actions returned by the connection state machine on the wire.
-async fn perform_actions(
-    socket: &UdpSocket,
-    session: &IotcSession,
-    actions: &[ConnectionAction],
-) -> Result<()> {
-    for action in actions {
-        match action {
-            ConnectionAction::SendMasterHandshake => {
-                for addr in &session.connection.master_addrs {
-                    socket
-                        .send_to(&session.connection.master_record, addr)
-                        .await?;
-                }
+// Puts an action returned by the connection state machine on the wire. The
+// machine crafts the records; this only does I/O.
+async fn perform_action(socket: &UdpSocket, action: ConnectionAction) -> Result<()> {
+    match action {
+        ConnectionAction::SendToAll { data, addrs } => {
+            for addr in addrs {
+                socket.send_to(&data, addr).await?;
             }
-            ConnectionAction::SendHelloServer => {
-                for entry in &session.connection.server_entries {
-                    let target = SocketAddr::from((entry.ip_address, entry.port));
-                    socket.send_to(&session.connection.hello_packet, target).await?;
-                }
-            }
-            ConnectionAction::SendP2PInitHandshake => {
-                for (addr, record) in &session.connection.handshake_records {
-                    socket.send_to(record, addr).await?;
-                }
-            }
-            ConnectionAction::SendKeepAlive => {
-                let Some((addr, record)) = &session.connection.keepalive else {
-                    unreachable!("Keepalive requested without a connected peer");
-                };
-                socket.send_to(record, addr).await?;
-                debug!("Keepalive sent");
-            }
-            ConnectionAction::Finished => {}
         }
+        ConnectionAction::Send { data, to } => {
+            socket.send_to(&data, to).await?;
+        }
+        ConnectionAction::Finished => {}
     }
 
     Ok(())
@@ -1515,23 +1529,31 @@ mod packet_writer_tests {
             PeerState::DeviceReportedOffline
         );
         assert!(session.device_offline_everywhere());
-        assert_eq!(session.connection.state, ConnectionState::Idle);
+        assert!(matches!(session.state, ConnectionState::Idle));
     }
 
     #[test]
     fn connection_state_machine_transitions_through_the_phases() {
         let mut session = IotcSession::new(1, "ABCDEFGHIJKLMNOPQRST").unwrap();
-        assert_eq!(session.connection.state, ConnectionState::Idle);
+        assert!(matches!(session.state, ConnectionState::Idle));
 
         let master_addr = SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 10240));
-        session.start_connection(vec![master_addr], vec![0x51, 0xcc]);
+        session.start_connection(vec![master_addr]);
         assert!(matches!(
-            session.connection.state,
+            session.state,
             ConnectionState::MasterHandshake { .. }
         ));
+
+        // On a tick, the machine crafts the master record last minute and
+        // fans it out to every master address.
+        let actions = session.on_tick().unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [ConnectionAction::SendToAll { addrs, .. }] if addrs == &vec![master_addr]
+        ));
         assert_eq!(
-            session.on_tick().unwrap(),
-            vec![ConnectionAction::SendMasterHandshake]
+            actions[0].data().len(),
+            constants::RECORD_HEADER_SIZE + 0x100
         );
 
         // The master returned a server list: entry actions of the
@@ -1542,36 +1564,37 @@ mod packet_writer_tests {
             port: 3478,
             pub_key: test_public_key().unwrap(),
         };
-        let actions = session.enter_p2p_handshaking(vec![entry]).unwrap();
-        assert_eq!(
-            actions,
-            vec![
-                ConnectionAction::SendHelloServer,
-                ConnectionAction::SendP2PInitHandshake
-            ]
-        );
-        assert!(matches!(
-            session.connection.state,
-            ConnectionState::P2PHandshaking { .. }
-        ));
         let peer_addr = SocketAddr::from((Ipv4Addr::new(5, 6, 7, 8), 3478));
+        let actions = session.enter_p2p_handshaking(vec![entry]).unwrap();
+        // The hello to every candidate, then one handshake record per
+        // candidate.
+        assert!(matches!(
+            actions[0],
+            ConnectionAction::SendToAll { ref addrs, .. } if addrs == &vec![peer_addr]
+        ));
+        assert!(matches!(
+            actions[1],
+            ConnectionAction::Send { ref to, .. } if to == &peer_addr
+        ));
+        assert_eq!(actions[1].data().len(), constants::RECORD_HEADER_SIZE + 0xac);
+        assert!(matches!(session.state, ConnectionState::P2PHandshaking { .. }));
         assert_eq!(session.peers.len(), 1);
         assert_eq!(
             session.peers[&peer_addr].state,
             PeerState::AwaitingHandshakeResp
         );
-        assert_eq!(
-            session.on_tick().unwrap(),
-            vec![ConnectionAction::SendP2PInitHandshake]
-        );
+
+        // Each tick recrafts one handshake record per candidate.
+        let actions = session.on_tick().unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [ConnectionAction::Send { ref to, .. }] if to == &peer_addr
+        ));
 
         // A duplicate master response no longer transitions anything.
         let actions = session.enter_p2p_handshaking(vec![]).unwrap();
         assert!(actions.is_empty());
-        assert!(matches!(
-            session.connection.state,
-            ConnectionState::P2PHandshaking { .. }
-        ));
+        assert!(matches!(session.state, ConnectionState::P2PHandshaking { .. }));
 
         // The handshake response is accepted: the per-peer machine promotes
         // the peer, then the main machine enters Connected with this peer
@@ -1588,25 +1611,32 @@ mod packet_writer_tests {
             session.peers[&peer_addr].state,
             PeerState::Connected { record_sid: 0xdeadbeef, keepalive_interval: 42, .. }
         ));
-        session.enter_connected(peer_addr, 0xdeadbeef, 42).unwrap();
-        assert_eq!(
-            session.connection.state,
+        session.enter_connected(peer_addr, 0xdeadbeef, 42);
+        assert!(matches!(
+            session.state,
             ConnectionState::Connected {
-                peer: peer_addr
-            }
-        );
-        assert!(session.connection.keepalive.is_some());
-        assert_eq!(session.connection.keepalive_period, Duration::from_secs(42));
+                peer,
+                record_sid: 0xdeadbeef,
+                keepalive_period,
+                ..
+            } if peer == peer_addr && keepalive_period == Duration::from_secs(42)
+        ));
 
         // Keepalives are not due yet...
         assert!(session.on_tick().unwrap().is_empty());
 
         // ...then they are.
-        session.connection.last_keepalive -= Duration::from_secs(60);
-        assert_eq!(
-            session.on_tick().unwrap(),
-            vec![ConnectionAction::SendKeepAlive]
-        );
+        if let ConnectionState::Connected {
+            next_keepalive, ..
+        } = &mut session.state
+        {
+            *next_keepalive -= Duration::from_secs(60);
+        }
+        let actions = session.on_tick().unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [ConnectionAction::Send { ref to, ref data }] if to == &peer_addr && data.len() == 0x18
+        ));
     }
 
     #[test]
