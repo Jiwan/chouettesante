@@ -21,7 +21,11 @@ use tokio::net::{lookup_host, UdpSocket};
 use tracing::{debug, warn};
 use tracing_subscriber::field::debug;
 
-use crate::{charlie_cypher, charlie_cypher::decypher, utils::{BinaryReader, BinaryWriter, SocketUtils}};
+use crate::{
+    charlie_cypher,
+    charlie_cypher::decypher,
+    utils::{BinaryReader, BinaryWriter, SocketUtils},
+};
 
 use super::{
     constants,
@@ -184,7 +188,10 @@ where
 
     let aad = &record_writer.get_ref()[..header_size];
     let (ciphertext, tag) = encryption.encrypt(&payload, aad)?;
-    assert_eq!(ciphertext.len() + tag.len(), record_size - extended_header_size);
+    assert_eq!(
+        ciphertext.len() + tag.len(),
+        record_size - extended_header_size
+    );
 
     record_writer.write_bytes(&ciphertext)?;
     record_writer.write_bytes(&tag)?;
@@ -251,8 +258,8 @@ struct PacketHeader {
     channel_id: u8,
     flags: u8,
     command_options: u16, // Speculative field.
-    session_id: u16, // Speculative field.
-    channel_flags: u8, // Speculative field.
+    session_id: u16,      // Speculative field.
+    channel_flags: u8,    // Speculative field.
 }
 
 // Writes a packet, from _IOTC_Packet_Handler in libIOTCAPIs.so. The header is
@@ -310,7 +317,7 @@ where
     Ok(())
 }
 
-fn make_record_send_master_handshake(session: &IotcSession) -> Result<Vec<u8>> {
+fn make_record_send_master_handshake(session: &SessionCore) -> Result<Vec<u8>> {
     // From iotcRecordSendMasterHandshake in libIOTCAPIs.so.
     const RECORD_SIZE: usize = 0x100;
     const EXPECTED_PACKET_SIZE: usize = 0x58;
@@ -352,7 +359,10 @@ fn make_record_send_master_handshake(session: &IotcSession) -> Result<Vec<u8>> {
     )
 }
 
-fn make_p2p_init_packet(packet_writer: &mut Cursor<&mut [u8]>, session: &IotcSession) -> Result<()> {
+fn make_p2p_init_packet(
+    packet_writer: &mut Cursor<&mut [u8]>,
+    session: &SessionCore,
+) -> Result<()> {
     const EXPECTED_CONTENT_SIZE: usize = 0x24;
 
     write_packet(
@@ -383,7 +393,7 @@ fn make_p2p_init_packet(packet_writer: &mut Cursor<&mut [u8]>, session: &IotcSes
 }
 
 fn make_record_send_p2p_init_handshake_req(
-    session: &mut IotcSession,
+    session: &mut SessionCore,
     server_entry: &ServerEntry,
 ) -> Result<Vec<u8>> {
     // From iotcRecordSendP2PInitHandshakeReq in libIOTCAPIs.so.
@@ -391,8 +401,9 @@ fn make_record_send_p2p_init_handshake_req(
     const EXPECTED_PACKET_SIZE: usize = 0x34;
 
     let peer_address = SocketAddr::from((server_entry.ip_address, server_entry.port));
-    let P2PPeer { aes_key, aes_iv, .. } =
-        *session.get_or_create_peer(&peer_address, &server_entry.pub_key)?;
+    let P2PPeer {
+        aes_key, aes_iv, ..
+    } = *session.get_or_create_peer(&peer_address, &server_entry.pub_key)?;
 
     let der = session.ecdh_key.public_key_to_der()?;
     assert_eq!(der.len(), 0x5b, "ECDH DER key must be exactly 0x5B bytes");
@@ -402,7 +413,10 @@ fn make_record_send_p2p_init_handshake_req(
         session.session_id,
         RECORD_SIZE,
         EXPECTED_PACKET_SIZE,
-        RecordEncryption::Aes128Gcm { key: aes_key, iv: aes_iv },
+        RecordEncryption::Aes128Gcm {
+            key: aes_key,
+            iv: aes_iv,
+        },
         move |writer| {
             writer.write_bytes(&aes_iv)?;
             writer.write_bytes(&der)?;
@@ -413,7 +427,7 @@ fn make_record_send_p2p_init_handshake_req(
     )
 }
 
-fn make_hello_server(session: &IotcSession) -> Result<Vec<u8>> {
+fn make_hello_server(session: &SessionCore) -> Result<Vec<u8>> {
     // From HelloServer in libIOTCAPIs.so.
     const EXPECTED_CONTENT_SIZE: usize = 0x8;
 
@@ -474,7 +488,7 @@ fn make_record_send_p2p_keep_alive(record_sid: u32) -> Result<Vec<u8>> {
 fn parse_record_p2p_init_handshake_resp(
     buffer: &[u8],
     record_size: usize,
-    session: &IotcSession,
+    session: &SessionCore,
     from: SocketAddr,
 ) -> Result<(u32, u16)> {
     // Layout: header (aad) | payload | tag
@@ -538,8 +552,7 @@ fn parse_record_p2p_init_handshake_resp(
     }
 
     // Keepalive interval, in seconds, at content offset 0x34.
-    let keepalive_interval =
-        Cursor::new(&packet[PACKET_HEADER_SIZE + 0x34..]).read_le_u16()?;
+    let keepalive_interval = Cursor::new(&packet[PACKET_HEADER_SIZE + 0x34..]).read_le_u16()?;
 
     debug!(
         "Handshake response accepted: record sid 0x{:08x}, keepalive interval {}s",
@@ -562,7 +575,33 @@ fn parse_record_keep_alive(buffer: &[u8]) -> Result<u32> {
     Ok(record_sid)
 }
 
-pub struct IotcSession {
+// Mirrors the per-server state in the Session server table (state byte at
+// +0x7e7) in libIOTCAPIs.so: one machine per server peer, tracking how the
+// rendezvous with the device progresses through that particular server.
+#[derive(Debug, PartialEq)]
+enum PeerState {
+    AwaitingHandshakeResp,
+    // The server reported the device as not connected there (cmd 0x227).
+    DeviceReportedOffline,
+    // The server reported the device as connected there (cmd 0x229).
+    DeviceReportedOnline,
+    // The type 3 handshake response was accepted: this peer carries the
+    // session from now on.
+    Connected {
+        record_sid: u32,
+        keepalive_interval: u16,
+        last_alive: Instant,
+    },
+}
+
+struct P2PPeer {
+    aes_key: [u8; 16],
+    aes_iv: [u8; 12],
+    state: PeerState,
+}
+
+// Shared session data, owned by all states. Sort off mirror Session in libIOTCAPIs.so.
+pub struct SessionCore {
     session_id: u32,
     device_id: [u8; 20],
     aes_key: [u8; 16],
@@ -573,61 +612,55 @@ pub struct IotcSession {
     // Mirrors Session.peers[0..0xb] in libIOTCAPIs.so: one set of P2P
     // credentials per server address.
     peers: HashMap<SocketAddr, P2PPeer>,
-    // The main connection state machine, mirroring Session.field_0x740.
-    state: ConnectionState,
     // Our public address as seen by the P2P servers, from addNatRecord.
     public_address: Option<SocketAddr>,
 }
 
-struct P2PPeer {
-    aes_key: [u8; 16],
-    aes_iv: [u8; 12],
-    state: PeerState,
+// The following structs mirror Session.field_0x740 in libIOTCAPIs.so: the main connection state
+// machine, as a typestate.
+
+// No connection started yet.
+struct Idle {
+    core: SessionCore,
 }
 
-// Mirrors Session.field_0x740 in libIOTCAPIs.so: the main connection state
-// machine. It does not run any I/O itself: connect() feeds it events and
-// performs the returned actions, so every transition (and its entry
-// actions, like the fan-outs) is driven by the current state rather than
-// by the order of statements in connect(). Each variant carries the data
-// that matters in that state; the wire records are never stored, they are
-// crafted from the session right before sending.
-#[derive(Debug, Clone)]
-enum ConnectionState {
-    Idle,
-    // Master handshake records resent to every master address on each tick
-    // until one answers (state 1).
-    MasterHandshake {
-        addrs: Vec<SocketAddr>,
-        deadline: Instant,
-    },
-    // P2P init handshake requests resent to every candidate on each tick
-    // (states 4-5). The binary's states 2-4 (hello/pre-session wait) are
-    // folded into the MasterHandshake -> P2PHandshaking transition since we
-    // do not implement the pre-session wait.
-    P2PHandshaking {
-        servers: Vec<ServerEntry>,
-        deadline: Instant,
-        offline_warning_sent: bool,
-    },
-    // One peer carries the session; unencrypted keepalives at the
-    // server-provided interval (state 6).
-    Connected {
-        peer: SocketAddr,
-        record_sid: u32,
-        keepalive_period: Duration,
-        next_keepalive: Instant,
-        // Observe the connected session for 30s for now; becomes "forever"
-        // once the data channels are implemented.
-        observe_until: Instant,
-    },
+// Master handshake records resent to every master address on each tick
+// until one answers (state 1).
+struct MasterHandshake {
+    core: SessionCore,
+    addrs: Vec<SocketAddr>,
+    deadline: Instant,
 }
 
-// The main machine's inputs: datagrams and timer ticks.
-#[derive(Debug)]
-enum ConnectionEvent<'a> {
-    Datagram { data: &'a [u8], from: SocketAddr },
-    Tick,
+// P2P init handshake requests resent to every candidate on each tick
+// (states 4-5). The binary's states 2-4 (hello/pre-session wait) are folded
+// into the MasterHandshake -> P2PHandshaking transition since we do not
+// implement the pre-session wait.
+struct P2PHandshaking {
+    core: SessionCore,
+    servers: Vec<ServerEntry>,
+    deadline: Instant,
+    offline_warning_sent: bool,
+}
+
+// One peer carries the session; unencrypted keepalives at the
+// server-provided interval (state 6).
+struct Connected {
+    core: SessionCore,
+    peer: SocketAddr,
+    record_sid: u32,
+    keepalive_period: Duration,
+    next_keepalive: Instant,
+    // Observe the connected session for 30s for now; becomes "forever"
+    // once the data channels are implemented.
+    observe_until: Instant,
+}
+
+enum Session {
+    Idle(Idle),
+    MasterHandshake(MasterHandshake),
+    P2PHandshaking(P2PHandshaking),
+    Connected(Connected),
 }
 
 // The main machine's outputs: one datagram to put on the wire per action,
@@ -648,25 +681,6 @@ impl ConnectionAction {
     }
 }
 
-// Mirrors the per-server state in the Session server table (state byte at
-// +0x7e7) in libIOTCAPIs.so: one machine per server peer, tracking how the
-// rendezvous with the device progresses through that particular server.
-#[derive(Debug, PartialEq)]
-enum PeerState {
-    AwaitingHandshakeResp,
-    // The server reported the device as not connected there (cmd 0x227).
-    DeviceReportedOffline,
-    // The server reported the device as connected there (cmd 0x229).
-    DeviceReportedOnline,
-    // The type 3 handshake response was accepted: this peer carries the
-    // session from now on.
-    Connected {
-        record_sid: u32,
-        keepalive_interval: u16,
-        last_alive: Instant,
-    },
-}
-
 #[derive(Debug, Clone)]
 pub struct ServerEntry {
     ip_address: IpAddr,
@@ -674,8 +688,8 @@ pub struct ServerEntry {
     pub_key: PKey<Public>,
 }
 
-impl IotcSession {
-    fn new(session_id: u32, uid: &str) -> Result<Self> {
+impl SessionCore {
+    fn new(session_id: u32, uid: &str) -> Self {
         let device_id: String = uid.to_lowercase();
         let nonce1 = rand::random::<u16>();
         let nonce2 = rand::random::<u16>();
@@ -686,18 +700,17 @@ impl IotcSession {
         let mut aes_iv: [u8; 12] = [0; 12];
         rand::fill(&mut aes_iv);
 
-        Ok(Self {
+        Self {
             session_id,
-            device_id: device_id.as_bytes().try_into()?,
+            device_id: device_id.as_bytes().try_into().unwrap(),
             aes_key,
             aes_iv,
             nonce1,
             nonce2,
-            ecdh_key: generate_ecdh_key()?,
+            ecdh_key: generate_ecdh_key().unwrap(),
             peers: HashMap::new(),
-            state: ConnectionState::Idle,
             public_address: None,
-        })
+        }
     }
 
     // Mirrors iotcGetP2PKeyInfo/iotcUpdateP2PAESKeys in libIOTCAPIs.so: the
@@ -729,127 +742,105 @@ impl IotcSession {
     fn peer_mut(&mut self, address: &SocketAddr) -> Option<&mut P2PPeer> {
         self.peers.get_mut(address)
     }
+}
 
-    // The main machine entry point: consumes an event, applies it to the
-    // per-peer machines and to the connection machine, and returns the
-    // actions the driver must perform on the socket.
-    fn handle_event(&mut self, event: ConnectionEvent) -> Result<Vec<ConnectionAction>> {
-        match event {
-            ConnectionEvent::Datagram { data, from } => self.on_datagram(data, from),
-            ConnectionEvent::Tick => self.on_tick(),
+impl Session {
+    // Only an idle session can start connecting; any other state is a
+    // driver bug, mirroring iotc_connect failing on an in-use session.
+    fn start_connection(self, master_addrs: Vec<SocketAddr>) -> Result<Session> {
+        match self {
+            Session::Idle(idle) => Ok(Session::MasterHandshake(
+                idle.start_connection(master_addrs),
+            )),
+            _ => bail!("Only an idle session can start connecting"),
         }
-    }
-
-    // Starts the connection machine: the master handshake will be crafted
-    // and resent to every address on each tick until one answers.
-    fn start_connection(&mut self, master_addrs: Vec<SocketAddr>) {
-        self.state = ConnectionState::MasterHandshake {
-            addrs: master_addrs,
-            deadline: Instant::now() + Duration::from_secs(60),
-        };
     }
 
     fn on_tick(&mut self) -> Result<Vec<ConnectionAction>> {
-        let now = Instant::now();
-
-        // Match on a clone so the records can be crafted through &mut self
-        // without holding a borrow on the state.
-        match self.state.clone() {
-            ConnectionState::Idle => Ok(vec![]),
-
-            ConnectionState::MasterHandshake { addrs, deadline } => {
-                if now > deadline {
-                    bail!("Timed out waiting for the master handshake response");
-                }
-
-                let data = make_record_send_master_handshake(self)?;
-
-                Ok(addrs
-                    .into_iter()
-                    .map(|to| ConnectionAction::Send { data: data.clone(), to })
-                    .collect())
-            }
-
-            ConnectionState::P2PHandshaking { servers, deadline, .. } => {
-                if now > deadline {
-                    bail!("Timed out waiting for the P2P handshake response");
-                }
-
-                // One record per candidate; this also creates the peers on
-                // the first pass (their credentials are cached afterwards).
-                servers
-                    .iter()
-                    .map(|server| {
-                        Ok(ConnectionAction::Send {
-                            data: make_record_send_p2p_init_handshake_req(self, server)?,
-                            to: SocketAddr::from((server.ip_address, server.port)),
-                        })
-                    })
-                    .collect()
-            }
-
-            ConnectionState::Connected {
-                peer,
-                record_sid,
-                keepalive_period,
-                next_keepalive,
-                observe_until,
-            } => {
-                if now > observe_until {
-                    return Ok(vec![ConnectionAction::Finished]);
-                }
-
-                if now >= next_keepalive {
-                    if let ConnectionState::Connected {
-                        next_keepalive, ..
-                    } = &mut self.state
-                    {
-                        *next_keepalive = now + keepalive_period;
-                    }
-
-                    return Ok(vec![ConnectionAction::Send {
-                        data: make_record_send_p2p_keep_alive(record_sid)?,
-                        to: peer,
-                    }]);
-                }
-
-                Ok(vec![])
-            }
+        match self {
+            Session::Idle(_) => Ok(vec![]),
+            Session::MasterHandshake(state) => state.on_tick(),
+            Session::P2PHandshaking(state) => state.on_tick(),
+            Session::Connected(state) => state.on_tick(),
         }
     }
 
-    fn on_datagram(&mut self, data: &[u8], from: SocketAddr) -> Result<Vec<ConnectionAction>> {
-        let outcome = parse(data, Some(self), Some(from))?;
-        self.apply_peer_outcome(&outcome, from);
+    // Consumes the session and returns the next one alongside the actions:
+    // transitions are moves between states, not writes into a borrowed
+    // self.
+    fn on_datagram(
+        self,
+        data: &[u8],
+        from: SocketAddr,
+    ) -> Result<(Session, Vec<ConnectionAction>)> {
+        match self {
+            Session::Idle(state) => state.on_datagram(data, from),
+            Session::MasterHandshake(state) => state.on_datagram(data, from),
+            Session::P2PHandshaking(state) => state.on_datagram(data, from),
+            Session::Connected(state) => state.on_datagram(data, from),
+        }
+    }
+}
+
+impl Idle {
+    // Starts the connection machine: the master handshake will be crafted
+    // and resent to every address on each tick until one answers.
+    fn start_connection(self, master_addrs: Vec<SocketAddr>) -> MasterHandshake {
+        MasterHandshake {
+            core: self.core,
+            addrs: master_addrs,
+            deadline: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    // Datagrams still update the peers and the public address, but an
+    // idle session never transitions.
+    fn on_datagram(
+        mut self,
+        data: &[u8],
+        from: SocketAddr,
+    ) -> Result<(Session, Vec<ConnectionAction>)> {
+        let outcome = parse(data, Some(&self.core), Some(from))?;
+        self.core.apply_peer_outcome(&outcome, from);
+
+        Ok((Session::Idle(self), vec![]))
+    }
+}
+
+impl MasterHandshake {
+    fn on_tick(&mut self) -> Result<Vec<ConnectionAction>> {
+        let now = Instant::now();
+
+        if now > self.deadline {
+            bail!("Timed out waiting for the master handshake response");
+        }
+
+        let data = make_record_send_master_handshake(&self.core)?;
+
+        Ok(self
+            .addrs
+            .iter()
+            .map(|to| ConnectionAction::Send {
+                data: data.clone(),
+                to: *to,
+            })
+            .collect())
+    }
+
+    fn on_datagram(
+        mut self,
+        data: &[u8],
+        from: SocketAddr,
+    ) -> Result<(Session, Vec<ConnectionAction>)> {
+        let outcome = parse(data, Some(&self.core), Some(from))?;
+        self.core.apply_peer_outcome(&outcome, from);
 
         match outcome {
-            ParseOutcome::ServerList(servers) => self.enter_p2p_handshaking(servers),
-            ParseOutcome::HandshakeResp {
-                record_sid,
-                keepalive_interval,
-            } => Ok(self.enter_connected(from, record_sid, keepalive_interval)),
-            ParseOutcome::DeviceStatus { .. } => {
-                // One aggregated warning once every peer reports the device
-                // as offline there.
-                let device_offline_everywhere = self.device_offline_everywhere();
-
-                if let ConnectionState::P2PHandshaking {
-                    offline_warning_sent,
-                    ..
-                } = &mut self.state
-                {
-                    if device_offline_everywhere && !*offline_warning_sent {
-                        *offline_warning_sent = true;
-                        warn!(
-                            "The device is reported offline by all {} P2P servers",
-                            self.peers.len()
-                        );
-                    }
-                }
-
-                Ok(vec![])
+            ParseOutcome::ServerList(servers) => {
+                let (state, actions) = self.enter_p2p_handshaking(servers)?;
+                Ok((Session::P2PHandshaking(state), actions))
             }
-            _ => Ok(vec![]),
+            _ => Ok((Session::MasterHandshake(self), vec![])),
         }
     }
 
@@ -858,14 +849,9 @@ impl IotcSession {
     // records also creates the peers, each starting in
     // AwaitingHandshakeResp.
     fn enter_p2p_handshaking(
-        &mut self,
+        self,
         servers: Vec<ServerEntry>,
-    ) -> Result<Vec<ConnectionAction>> {
-        if !matches!(self.state, ConnectionState::MasterHandshake { .. }) {
-            debug!("Ignoring a duplicate master handshake response");
-            return Ok(vec![]);
-        }
-
+    ) -> Result<(P2PHandshaking, Vec<ConnectionAction>)> {
         debug!("Master returned {} P2P server candidates", servers.len());
 
         let addrs: Vec<SocketAddr> = servers
@@ -876,7 +862,8 @@ impl IotcSession {
         // Entry actions: one hello packet per candidate (the same packet,
         // so it is crafted once and cloned), then one handshake record per
         // candidate, which also creates the peers.
-        let hello_packet = make_hello_server(self)?;
+        let mut core = self.core;
+        let hello_packet = make_hello_server(&core)?;
         let mut actions: Vec<ConnectionAction> = addrs
             .iter()
             .map(|to| ConnectionAction::Send {
@@ -887,56 +874,156 @@ impl IotcSession {
 
         for (server, to) in servers.iter().zip(addrs) {
             actions.push(ConnectionAction::Send {
-                data: make_record_send_p2p_init_handshake_req(self, server)?,
+                data: make_record_send_p2p_init_handshake_req(&mut core, server)?,
                 to,
             });
         }
 
-        self.state = ConnectionState::P2PHandshaking {
-            servers,
-            deadline: Instant::now() + Duration::from_secs(60),
-            offline_warning_sent: false,
-        };
+        Ok((
+            P2PHandshaking {
+                core,
+                servers,
+                deadline: Instant::now() + Duration::from_secs(60),
+                offline_warning_sent: false,
+            },
+            actions,
+        ))
+    }
+}
 
-        Ok(actions)
+impl P2PHandshaking {
+    fn on_tick(&mut self) -> Result<Vec<ConnectionAction>> {
+        let now = Instant::now();
+
+        if now > self.deadline {
+            bail!("Timed out waiting for the P2P handshake response");
+        }
+
+        // One record per candidate; this also creates the peers on the
+        // first pass (their credentials are cached afterwards). The
+        // servers and the crafting core are disjoint fields, so both may
+        // be borrowed at once.
+        self.servers
+            .iter()
+            .map(|server| {
+                Ok(ConnectionAction::Send {
+                    data: make_record_send_p2p_init_handshake_req(&mut self.core, server)?,
+                    to: SocketAddr::from((server.ip_address, server.port)),
+                })
+            })
+            .collect()
+    }
+
+    fn on_datagram(
+        mut self,
+        data: &[u8],
+        from: SocketAddr,
+    ) -> Result<(Session, Vec<ConnectionAction>)> {
+        let outcome = parse(data, Some(&self.core), Some(from))?;
+        self.core.apply_peer_outcome(&outcome, from);
+
+        match outcome {
+            // A master response that arrives once the handshakes are
+            // already running is a duplicate: no way back.
+            ParseOutcome::ServerList(_) => {
+                debug!("Ignoring a duplicate master handshake response");
+                Ok((Session::P2PHandshaking(self), vec![]))
+            }
+            ParseOutcome::HandshakeResp {
+                record_sid,
+                keepalive_interval,
+            } => Ok((
+                self.enter_connected(from, record_sid, keepalive_interval),
+                vec![],
+            )),
+            ParseOutcome::DeviceStatus { .. } => {
+                // One aggregated warning once every peer reports the device
+                // as offline there.
+                if self.core.device_offline_everywhere() && !self.offline_warning_sent {
+                    self.offline_warning_sent = true;
+                    warn!(
+                        "The device is reported offline by all {} P2P servers",
+                        self.core.peers.len()
+                    );
+                }
+
+                Ok((Session::P2PHandshaking(self), vec![]))
+            }
+            _ => Ok((Session::P2PHandshaking(self), vec![])),
+        }
     }
 
     // P2PHandshaking -> Connected: this peer carries the session from now
-    // on; keepalives start at the server-provided interval.
+    // on; keepalives start at the server-provided interval. The per-peer
+    // machine must have promoted this peer already (by apply_peer_outcome
+    // above); otherwise the session stays handshaking.
     fn enter_connected(
-        &mut self,
+        self,
         peer: SocketAddr,
         record_sid: u32,
         keepalive_interval: u16,
-    ) -> Vec<ConnectionAction> {
-        if !matches!(self.state, ConnectionState::P2PHandshaking { .. }) {
-            return vec![];
-        }
-
-        // The per-peer machine must have promoted this peer already.
+    ) -> Session {
         if !matches!(
-            self.peers.get(&peer).map(|p| &p.state),
+            self.core.peers.get(&peer).map(|p| &p.state),
             Some(PeerState::Connected { .. })
         ) {
-            return vec![];
+            return Session::P2PHandshaking(self);
         }
 
         debug!("Connected to P2P server {}", peer);
 
         let keepalive_period = Duration::from_secs(keepalive_interval.max(1) as u64);
-        self.state = ConnectionState::Connected {
+        let now = Instant::now();
+
+        Session::Connected(Connected {
+            core: self.core,
             peer,
             record_sid,
             keepalive_period,
-            next_keepalive: Instant::now() + keepalive_period,
-            observe_until: Instant::now() + Duration::from_secs(30),
-        };
+            next_keepalive: now + keepalive_period,
+            observe_until: now + Duration::from_secs(30),
+        })
+    }
+}
 
-        vec![]
+impl Connected {
+    fn on_tick(&mut self) -> Result<Vec<ConnectionAction>> {
+        let now = Instant::now();
+
+        if now > self.observe_until {
+            return Ok(vec![ConnectionAction::Finished]);
+        }
+
+        if now >= self.next_keepalive {
+            self.next_keepalive = now + self.keepalive_period;
+
+            return Ok(vec![ConnectionAction::Send {
+                data: make_record_send_p2p_keep_alive(self.record_sid)?,
+                to: self.peer,
+            }]);
+        }
+
+        Ok(vec![])
     }
 
+    // Once connected, datagrams only feed the per-peer machines (keepalive
+    // last-alive bookkeeping and so on); the session never transitions
+    // back.
+    fn on_datagram(
+        mut self,
+        data: &[u8],
+        from: SocketAddr,
+    ) -> Result<(Session, Vec<ConnectionAction>)> {
+        let outcome = parse(data, Some(&self.core), Some(from))?;
+        self.core.apply_peer_outcome(&outcome, from);
+
+        Ok((Session::Connected(self), vec![]))
+    }
+}
+
+impl SessionCore {
     // Applies a parsed wire fact to the per-peer state machines. The main
-    // machine transitions are handled by on_datagram.
+    // machine transitions are handled by the states' on_datagram.
     fn apply_peer_outcome(&mut self, outcome: &ParseOutcome, from: SocketAddr) {
         match outcome {
             ParseOutcome::HandshakeResp {
@@ -1009,7 +1096,7 @@ impl IotcSession {
 }
 
 pub struct IotcSessionManager {
-    sessions: HashMap<u32, IotcSession>,
+    sessions: HashMap<u32, Session>,
     session_id_counter: u32,
 }
 
@@ -1021,19 +1108,16 @@ impl IotcSessionManager {
         }
     }
 
-    fn create_session(&mut self, uid: &str) -> &mut IotcSession {
+    fn create_session(&mut self, uid: &str) -> Session {
         self.session_id_counter += 1;
-        self.sessions
-            .entry(self.session_id_counter)
-            .or_insert_with(|| IotcSession::new(self.session_id_counter, uid).unwrap())
+        let session_id = self.session_id_counter;
+        Session::Idle(Idle {
+            core: SessionCore::new(session_id, uid),
+        })
     }
 
-    fn get_session(&self, session_id: u32) -> Option<&IotcSession> {
-        self.sessions.get(&session_id)
-    }
-
-    fn get_session_mut(&mut self, session_id: u32) -> Option<&mut IotcSession> {
-        self.sessions.get_mut(&session_id)
+    fn take_session(&mut self, session_id: u32) -> Option<Session> {
+        self.sessions.remove(&session_id)
     }
 }
 
@@ -1085,9 +1169,7 @@ pub fn parse_packet(buffer: &[u8]) -> Result<PacketOutcome> {
     if packet_size as usize + PACKET_HEADER_SIZE != buffer_len {
         warn!(
             "Dropping packet with inconsistent size: {} + 0x{:x} != {}",
-            packet_size,
-            PACKET_HEADER_SIZE,
-            buffer_len
+            packet_size, PACKET_HEADER_SIZE, buffer_len
         );
         return Ok(PacketOutcome::Ignored);
     }
@@ -1196,7 +1278,7 @@ pub fn parse_packet(buffer: &[u8]) -> Result<PacketOutcome> {
 fn parse_record_handshake<T>(
     buffer: &[u8],
     cursor: &mut Cursor<T>,
-    session: &IotcSession,
+    session: &SessionCore,
 ) -> Result<Vec<ServerEntry>>
 where
     T: AsRef<[u8]>,
@@ -1309,7 +1391,7 @@ pub enum ParseOutcome {
 
 pub fn parse(
     buffer: &[u8],
-    session: Option<&IotcSession>,
+    session: Option<&SessionCore>,
     from: Option<SocketAddr>,
 ) -> Result<ParseOutcome> {
     // From iotcRecordHandler in libIOTCAPIs.so / handle_buffer
@@ -1381,7 +1463,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
     // From IOTC_Connect_UDP_Inner in libIOTCAPIs.so.
 
     let mut session_manager = IotcSessionManager::new();
-    let session = session_manager.create_session(uid);
+    let mut session = session_manager.create_session(uid);
 
     let master_domain_name = get_master_domain_name(region);
 
@@ -1400,7 +1482,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     debug!("Master addresses: {:?}", master_addrs);
 
-    session.start_connection(master_addrs);
+    let mut session = session.start_connection(master_addrs)?;
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let mut reception_buffer = vec![0; constants::RECORD_PACKET_MAX_SIZE];
@@ -1411,37 +1493,31 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
 
     loop {
         for action in actions {
-            if matches!(action, ConnectionAction::Finished) {
-                debug!("Connection finished, exiting loop");
-                return Ok(());
+            match action {
+                ConnectionAction::Send { data, to } => {
+                    socket.send_to(&data, to).await?;
+                }
+                ConnectionAction::Finished => {
+                    debug!("Connection finished, exiting loop");
+                    return Ok(());
+                }
             }
-
-            perform_action(&socket, action).await?;
         }
 
-        // One event per iteration: a datagram, or a 500ms tick.
-        actions = match socket.rcv_from_timeout(&mut reception_buffer, Duration::from_millis(500)).await {
+        actions = match socket
+            .rcv_from_timeout(&mut reception_buffer, Duration::from_millis(500))
+            .await
+        {
             Ok(Ok((data, from))) => {
                 debug!("Received {} bytes from {}", data.len(), from);
-                session.handle_event(ConnectionEvent::Datagram { data, from })?
+                let (next, actions) = session.on_datagram(data, from)?;
+                session = next;
+                actions
             }
             Ok(Err(e)) => return Err(e.into()),
             Err(_elapsed) => session.on_tick()?,
         };
     }
-}
-
-// Puts an action returned by the connection state machine on the wire. The
-// machine crafts the records; this only does I/O.
-async fn perform_action(socket: &UdpSocket, action: ConnectionAction) -> Result<()> {
-    match action {
-        ConnectionAction::Send { data, to } => {
-            socket.send_to(&data, to).await?;
-        }
-        ConnectionAction::Finished => {}
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1456,7 +1532,7 @@ mod packet_writer_tests {
 
     #[test]
     fn p2p_peer_credentials_are_cached_per_server_address() {
-        let mut session = IotcSession::new(1, "ABCDEFGHIJKLMNOPQRST").unwrap();
+        let mut session = SessionCore::new(1, "ABCDEFGHIJKLMNOPQRST").unwrap();
 
         let addr_a = SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 1111));
         let pub_a = test_public_key().unwrap();
@@ -1479,7 +1555,7 @@ mod packet_writer_tests {
 
     #[test]
     fn device_status_packet_flips_the_peer_state() {
-        let mut session = IotcSession::new(1, "ABCDEFGHIJKLMNOPQRST").unwrap();
+        let mut session = SessionCore::new(1, "ABCDEFGHIJKLMNOPQRST").unwrap();
         let addr = SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 1111));
         let pub_key = test_public_key().unwrap();
         session.get_or_create_peer(&addr, &pub_key).unwrap();
@@ -1525,25 +1601,19 @@ mod packet_writer_tests {
             },
             addr,
         );
-        assert_eq!(
-            session.peers[&addr].state,
-            PeerState::DeviceReportedOffline
-        );
+        assert_eq!(session.peers[&addr].state, PeerState::DeviceReportedOffline);
         assert!(session.device_offline_everywhere());
-        assert!(matches!(session.state, ConnectionState::Idle));
     }
 
     #[test]
     fn connection_state_machine_transitions_through_the_phases() {
-        let mut session = IotcSession::new(1, "ABCDEFGHIJKLMNOPQRST").unwrap();
-        assert!(matches!(session.state, ConnectionState::Idle));
+        let core = SessionCore::new(1, "ABCDEFGHIJKLMNOPQRST").unwrap();
+        let session = Session::Idle(Idle { core });
+        assert!(matches!(session, Session::Idle(_)));
 
         let master_addr = SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 10240));
-        session.start_connection(vec![master_addr]);
-        assert!(matches!(
-            session.state,
-            ConnectionState::MasterHandshake { .. }
-        ));
+        let mut session = session.start_connection(vec![master_addr]).unwrap();
+        assert!(matches!(session, Session::MasterHandshake(_)));
 
         // On a tick, the machine crafts the master record last minute and
         // sends it to every master address.
@@ -1566,7 +1636,11 @@ mod packet_writer_tests {
             pub_key: test_public_key().unwrap(),
         };
         let peer_addr = SocketAddr::from((Ipv4Addr::new(5, 6, 7, 8), 3478));
-        let actions = session.enter_p2p_handshaking(vec![entry]).unwrap();
+        let Session::MasterHandshake(state) = session else {
+            panic!("The session must be in the master handshake state");
+        };
+        let (state, actions) = state.enter_p2p_handshaking(vec![entry]).unwrap();
+        let mut session = Session::P2PHandshaking(state);
         // One hello per candidate, then one handshake record per candidate.
         assert_eq!(actions.len(), 2);
         assert!(matches!(
@@ -1578,11 +1652,16 @@ mod packet_writer_tests {
             ConnectionAction::Send { ref to, .. } if to == &peer_addr
         ));
         assert_eq!(actions[0].data().len(), 0x18);
-        assert_eq!(actions[1].data().len(), constants::RECORD_HEADER_SIZE + 0xac);
-        assert!(matches!(session.state, ConnectionState::P2PHandshaking { .. }));
-        assert_eq!(session.peers.len(), 1);
         assert_eq!(
-            session.peers[&peer_addr].state,
+            actions[1].data().len(),
+            constants::RECORD_HEADER_SIZE + 0xac
+        );
+        let Session::P2PHandshaking(state) = &session else {
+            panic!("The session must be handshaking");
+        };
+        assert_eq!(state.core.peers.len(), 1);
+        assert_eq!(
+            state.core.peers[&peer_addr].state,
             PeerState::AwaitingHandshakeResp
         );
 
@@ -1593,16 +1672,17 @@ mod packet_writer_tests {
             [ConnectionAction::Send { ref to, .. }] if to == &peer_addr
         ));
 
-        // A duplicate master response no longer transitions anything.
-        let actions = session.enter_p2p_handshaking(vec![]).unwrap();
-        assert!(actions.is_empty());
-        assert!(matches!(session.state, ConnectionState::P2PHandshaking { .. }));
+        // A duplicate master response cannot even be expressed anymore:
+        // only the MasterHandshake state knows how to enter P2P handshaking.
 
         // The handshake response is accepted: the per-peer machine promotes
         // the peer, then the main machine enters Connected with this peer
         // carrying the session and keepalives at the server-provided
         // interval.
-        session.apply_peer_outcome(
+        let Session::P2PHandshaking(mut state) = session else {
+            panic!("The session must be handshaking");
+        };
+        state.core.apply_peer_outcome(
             &ParseOutcome::HandshakeResp {
                 record_sid: 0xdeadbeef,
                 keepalive_interval: 42,
@@ -1610,28 +1690,29 @@ mod packet_writer_tests {
             peer_addr,
         );
         assert!(matches!(
-            session.peers[&peer_addr].state,
-            PeerState::Connected { record_sid: 0xdeadbeef, keepalive_interval: 42, .. }
-        ));
-        session.enter_connected(peer_addr, 0xdeadbeef, 42);
-        assert!(matches!(
-            session.state,
-            ConnectionState::Connected {
-                peer,
+            state.core.peers[&peer_addr].state,
+            PeerState::Connected {
                 record_sid: 0xdeadbeef,
+                keepalive_interval: 42,
+                ..
+            }
+        ));
+        let mut session = state.enter_connected(peer_addr, 0xdeadbeef, 42);
+        assert!(matches!(
+            &session,
+            Session::Connected(Connected {
+                peer,
+                record_sid,
                 keepalive_period,
                 ..
-            } if peer == peer_addr && keepalive_period == Duration::from_secs(42)
+            }) if *peer == peer_addr && *record_sid == 0xdeadbeef && *keepalive_period == Duration::from_secs(42)
         ));
 
         // Keepalives are not due yet...
         assert!(session.on_tick().unwrap().is_empty());
 
         // ...then they are.
-        if let ConnectionState::Connected {
-            next_keepalive, ..
-        } = &mut session.state
-        {
+        if let Session::Connected(Connected { next_keepalive, .. }) = &mut session {
             *next_keepalive -= Duration::from_secs(60);
         }
         let actions = session.on_tick().unwrap();
@@ -1643,7 +1724,7 @@ mod packet_writer_tests {
 
     #[test]
     fn master_handshake_uses_the_common_record_layout() {
-        let session = IotcSession::new(0x12345678, "ABCDEFGHIJKLMNOPQRST").unwrap();
+        let session = SessionCore::new(0x12345678, "ABCDEFGHIJKLMNOPQRST").unwrap();
 
         let record = make_record_send_master_handshake(&session).unwrap();
 
