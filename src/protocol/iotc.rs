@@ -566,7 +566,7 @@ fn parse_record_p2p_init_handshake_resp(
 // server's keepalive, fully unencrypted. Pure parse: returns the echoed
 // record SID.
 fn parse_record_keep_alive(buffer: &[u8]) -> Result<u32> {
-    let mut reader = Cursor::new(buffer);
+    let mut reader: Cursor<&[u8]> = Cursor::new(buffer);
     reader.set_position(constants::RECORD_HEADER_SIZE as u64);
     let record_sid = reader.read_le_u32()?;
 
@@ -661,125 +661,6 @@ enum Session {
     MasterHandshake(MasterHandshake),
     P2PHandshaking(P2PHandshaking),
     Connected(Connected),
-}
-
-// The main machine's outputs: one datagram to put on the wire per action,
-// or the end of the connection observation. The records are crafted last
-// minute by the machine itself.
-#[derive(Debug)]
-enum ConnectionAction {
-    Send { data: Vec<u8>, to: SocketAddr },
-    Finished,
-}
-
-impl ConnectionAction {
-    fn data(&self) -> &[u8] {
-        match self {
-            ConnectionAction::Send { data, .. } => data,
-            ConnectionAction::Finished => &[],
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ServerEntry {
-    ip_address: IpAddr,
-    port: u16,
-    pub_key: PKey<Public>,
-}
-
-impl SessionCore {
-    fn new(session_id: u32, uid: &str) -> Self {
-        let device_id: String = uid.to_lowercase();
-        let nonce1 = rand::random::<u16>();
-        let nonce2 = rand::random::<u16>();
-
-        let mut aes_key: [u8; 16] = [0; 16];
-        rand::fill(&mut aes_key);
-
-        let mut aes_iv: [u8; 12] = [0; 12];
-        rand::fill(&mut aes_iv);
-
-        Self {
-            session_id,
-            device_id: device_id.as_bytes().try_into().unwrap(),
-            aes_key,
-            aes_iv,
-            nonce1,
-            nonce2,
-            ecdh_key: generate_ecdh_key().unwrap(),
-            peers: HashMap::new(),
-            public_address: None,
-        }
-    }
-
-    // Mirrors iotcGetP2PKeyInfo/iotcUpdateP2PAESKeys in libIOTCAPIs.so: the
-    // peer AES key is derived from the ECDH shared secret with that peer's
-    // public key and the IV is freshly randomized per peer, both cached by
-    // server address.
-    fn get_or_create_peer(
-        &mut self,
-        address: &SocketAddr,
-        peer_pub_key: &PKey<Public>,
-    ) -> Result<&P2PPeer> {
-        if !self.peers.contains_key(address) {
-            let aes_key = derive_aes_128_key(&self.ecdh_key, peer_pub_key)?;
-            let mut aes_iv = [0u8; 12];
-            rand::fill(&mut aes_iv);
-            self.peers.insert(
-                *address,
-                P2PPeer {
-                    aes_key,
-                    aes_iv,
-                    state: PeerState::AwaitingHandshakeResp,
-                },
-            );
-        }
-
-        Ok(self.peers.get(address).unwrap())
-    }
-
-    fn peer_mut(&mut self, address: &SocketAddr) -> Option<&mut P2PPeer> {
-        self.peers.get_mut(address)
-    }
-}
-
-impl Session {
-    // Only an idle session can start connecting; any other state is a
-    // driver bug, mirroring iotc_connect failing on an in-use session.
-    fn start_connection(self, master_addrs: Vec<SocketAddr>) -> Result<Session> {
-        match self {
-            Session::Idle(idle) => Ok(Session::MasterHandshake(
-                idle.start_connection(master_addrs),
-            )),
-            _ => bail!("Only an idle session can start connecting"),
-        }
-    }
-
-    fn on_tick(&mut self) -> Result<Vec<ConnectionAction>> {
-        match self {
-            Session::Idle(_) => Ok(vec![]),
-            Session::MasterHandshake(state) => state.on_tick(),
-            Session::P2PHandshaking(state) => state.on_tick(),
-            Session::Connected(state) => state.on_tick(),
-        }
-    }
-
-    // Consumes the session and returns the next one alongside the actions:
-    // transitions are moves between states, not writes into a borrowed
-    // self.
-    fn on_datagram(
-        self,
-        data: &[u8],
-        from: SocketAddr,
-    ) -> Result<(Session, Vec<ConnectionAction>)> {
-        match self {
-            Session::Idle(state) => state.on_datagram(data, from),
-            Session::MasterHandshake(state) => state.on_datagram(data, from),
-            Session::P2PHandshaking(state) => state.on_datagram(data, from),
-            Session::Connected(state) => state.on_datagram(data, from),
-        }
-    }
 }
 
 impl Idle {
@@ -1018,6 +899,125 @@ impl Connected {
         self.core.apply_peer_outcome(&outcome, from);
 
         Ok((Session::Connected(self), vec![]))
+    }
+}
+
+// The main machine's outputs: one datagram to put on the wire per action,
+// or the end of the connection observation. The records are crafted last
+// minute by the machine itself.
+#[derive(Debug)]
+enum ConnectionAction {
+    Send { data: Vec<u8>, to: SocketAddr },
+    Finished,
+}
+
+impl ConnectionAction {
+    fn data(&self) -> &[u8] {
+        match self {
+            ConnectionAction::Send { data, .. } => data,
+            ConnectionAction::Finished => &[],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerEntry {
+    ip_address: IpAddr,
+    port: u16,
+    pub_key: PKey<Public>,
+}
+
+impl SessionCore {
+    fn new(session_id: u32, uid: &str) -> Self {
+        let device_id: String = uid.to_lowercase();
+        let nonce1 = rand::random::<u16>();
+        let nonce2 = rand::random::<u16>();
+
+        let mut aes_key: [u8; 16] = [0; 16];
+        rand::fill(&mut aes_key);
+
+        let mut aes_iv: [u8; 12] = [0; 12];
+        rand::fill(&mut aes_iv);
+
+        Self {
+            session_id,
+            device_id: device_id.as_bytes().try_into().unwrap(),
+            aes_key,
+            aes_iv,
+            nonce1,
+            nonce2,
+            ecdh_key: generate_ecdh_key().unwrap(),
+            peers: HashMap::new(),
+            public_address: None,
+        }
+    }
+
+    // Mirrors iotcGetP2PKeyInfo/iotcUpdateP2PAESKeys in libIOTCAPIs.so: the
+    // peer AES key is derived from the ECDH shared secret with that peer's
+    // public key and the IV is freshly randomized per peer, both cached by
+    // server address.
+    fn get_or_create_peer(
+        &mut self,
+        address: &SocketAddr,
+        peer_pub_key: &PKey<Public>,
+    ) -> Result<&P2PPeer> {
+        if !self.peers.contains_key(address) {
+            let aes_key = derive_aes_128_key(&self.ecdh_key, peer_pub_key)?;
+            let mut aes_iv = [0u8; 12];
+            rand::fill(&mut aes_iv);
+            self.peers.insert(
+                *address,
+                P2PPeer {
+                    aes_key,
+                    aes_iv,
+                    state: PeerState::AwaitingHandshakeResp,
+                },
+            );
+        }
+
+        Ok(self.peers.get(address).unwrap())
+    }
+
+    fn peer_mut(&mut self, address: &SocketAddr) -> Option<&mut P2PPeer> {
+        self.peers.get_mut(address)
+    }
+}
+
+impl Session {
+    // Only an idle session can start connecting; any other state is a
+    // driver bug, mirroring iotc_connect failing on an in-use session.
+    fn start_connection(self, master_addrs: Vec<SocketAddr>) -> Result<Session> {
+        match self {
+            Session::Idle(idle) => Ok(Session::MasterHandshake(
+                idle.start_connection(master_addrs),
+            )),
+            _ => bail!("Only an idle session can start connecting"),
+        }
+    }
+
+    fn on_tick(&mut self) -> Result<Vec<ConnectionAction>> {
+        match self {
+            Session::Idle(_) => Ok(vec![]),
+            Session::MasterHandshake(state) => state.on_tick(),
+            Session::P2PHandshaking(state) => state.on_tick(),
+            Session::Connected(state) => state.on_tick(),
+        }
+    }
+
+    // Consumes the session and returns the next one alongside the actions:
+    // transitions are moves between states, not writes into a borrowed
+    // self.
+    fn on_datagram(
+        self,
+        data: &[u8],
+        from: SocketAddr,
+    ) -> Result<(Session, Vec<ConnectionAction>)> {
+        match self {
+            Session::Idle(state) => state.on_datagram(data, from),
+            Session::MasterHandshake(state) => state.on_datagram(data, from),
+            Session::P2PHandshaking(state) => state.on_datagram(data, from),
+            Session::Connected(state) => state.on_datagram(data, from),
+        }
     }
 }
 
