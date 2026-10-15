@@ -286,7 +286,7 @@ pub(super) enum PacketOutcome {
 pub fn parse_packet(buffer: &[u8]) -> Result<PacketOutcome> {
     let buffer_len = buffer.len();
     let (header, content) = buffer
-        .split_at_checked(PACKET_HEADER_SIZE)
+        .split_at_checked(constants::PACKET_HEADER_SIZE)
         .context(ParseError::InvalidHeaderSize)?;
 
     let mut header = header.to_vec();
@@ -318,10 +318,10 @@ pub fn parse_packet(buffer: &[u8]) -> Result<PacketOutcome> {
     // From FUN_0004a770 in libIOTCAPIs.so: a packet is only processed when
     // the datagram is exactly the header plus the announced content size;
     // anything else is silently dropped.
-    if packet_size as usize + PACKET_HEADER_SIZE != buffer_len {
+    if packet_size as usize + constants::PACKET_HEADER_SIZE != buffer_len {
         warn!(
             "Dropping packet with inconsistent size: {} + 0x{:x} != {}",
-            packet_size, PACKET_HEADER_SIZE, buffer_len
+            packet_size, constants::PACKET_HEADER_SIZE, buffer_len
         );
         return Ok(PacketOutcome::Ignored);
     }
