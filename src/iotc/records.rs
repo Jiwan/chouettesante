@@ -20,7 +20,7 @@ use super::{
     session::{P2PPeer, ParseOutcome, ServerEntry, SessionCore},
     wire::{
         CmdType, PacketHeader, PacketOutcome, ParseError, RecordEncryption, RecordType,
-        PACKET_HEADER_SIZE, make_record, parse_packet, write_packet,
+        make_record, parse_packet, write_packet,
     },
 };
 
@@ -340,7 +340,7 @@ fn parse_record_p2p_init_handshake_resp(
         ));
     }
 
-    let mut content = Cursor::new(&packet[PACKET_HEADER_SIZE..]);
+    let mut content = Cursor::new(&packet[constants::PACKET_HEADER_SIZE..]);
     let nonce2_echo = content.read_le_u16()?;
     if nonce2_echo != session.nonce2 {
         return Err(anyhow::anyhow!(
@@ -360,7 +360,7 @@ fn parse_record_p2p_init_handshake_resp(
     }
 
     // Keepalive interval, in seconds, at content offset 0x34.
-    let keepalive_interval = Cursor::new(&packet[PACKET_HEADER_SIZE + 0x34..]).read_le_u16()?;
+    let keepalive_interval = Cursor::new(&packet[constants::PACKET_HEADER_SIZE + 0x34..]).read_le_u16()?;
 
     debug!(
         "Handshake response accepted: record sid 0x{:08x}, keepalive interval {}s",
