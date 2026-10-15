@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chouettesante::authentication::{self, google};
-use chouettesante::protocol::iotc::{connect, MasterRegion};
+use chouettesante::iotc::{connect, MasterRegion};
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, Level};
