@@ -1,6 +1,6 @@
 pub mod authentication;
 mod charlie_cypher;
-pub mod protocol;
+pub mod iotc;
 mod utils;
 
 use core::slice;
@@ -22,5 +22,5 @@ pub unsafe extern "C" fn charlie_decypher(data: *mut u8, len: usize) {
     }
 
     let slice = unsafe { slice::from_raw_parts_mut(data, len) };
-    let _ = protocol::iotc::parse(slice, None, None);
+    let _ = iotc::parse(slice, None, None);
 }
