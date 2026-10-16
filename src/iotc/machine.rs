@@ -1,20 +1,12 @@
 // Mirrors Session.field_0x740 in libIOTCAPIs.so: the main connection state
-// machine, as a typestate. One type per state, each owning the session
-// data plus the data that matters in that state; transitions consume the
-// current state, so an invalid transition (entering Connected from Idle,
-// say) is a compile error instead of a runtime guard. It does not run any
-// I/O itself: connect() feeds it events and performs the returned actions,
-// so every transition (and its entry actions, like the fan-outs) is driven
-// by the current state rather than by the order of statements in
-// connect(). The wire records are never stored, they are crafted from the
-// session right before sending.
+// machine, as a typestate.
 
 use std::{
     net::SocketAddr,
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use tracing::{debug, warn};
 
 use super::{
@@ -25,9 +17,6 @@ use super::{
     session::{ParseOutcome, PeerState, ServerEntry, SessionCore},
 };
 
-// The main machine's outputs: one datagram to put on the wire per action,
-// or the end of the connection observation. The records are crafted last
-// minute by the machine itself.
 #[derive(Debug)]
 pub(super) enum ConnectionAction {
     Send { data: Vec<u8>, to: SocketAddr },
@@ -96,6 +85,10 @@ impl Idle {
             addrs: master_addrs,
             deadline: Instant::now() + Duration::from_secs(60),
         }
+    }
+
+    fn on_tick(&mut self) -> Result<Vec<ConnectionAction>> {
+        Ok(vec![])
     }
 
     // Datagrams still update the peers and the public address, but an
@@ -311,9 +304,6 @@ impl Connected {
         Ok(vec![])
     }
 
-    // Once connected, datagrams only feed the per-peer machines (keepalive
-    // last-alive bookkeeping and so on); the session never transitions
-    // back.
     fn on_datagram(
         mut self,
         data: &[u8],
@@ -324,6 +314,26 @@ impl Connected {
 
         Ok((Session::Connected(self), vec![]))
     }
+}
+
+macro_rules! state_dispatch {
+    ($( $i:ident ),*) => {
+        pub(super) fn on_tick(&mut self) -> Result<Vec<ConnectionAction>> {
+            match self {
+                $( Session::$i(state) => state.on_tick(), )*
+            }
+        }
+
+        pub(super) fn on_datagram(
+            self,
+            data: &[u8],
+            from: SocketAddr,
+        ) -> Result<(Session, Vec<ConnectionAction>)> {
+            match self {
+                $( Session::$i(state) => state.on_datagram(data, from), )*
+            }
+        }
+    };
 }
 
 impl Session {
@@ -345,30 +355,7 @@ impl Session {
         }
     }
 
-    pub(super) fn on_tick(&mut self) -> Result<Vec<ConnectionAction>> {
-        match self {
-            Session::Idle(_) => Ok(vec![]),
-            Session::MasterHandshake(state) => state.on_tick(),
-            Session::P2PHandshaking(state) => state.on_tick(),
-            Session::Connected(state) => state.on_tick(),
-        }
-    }
-
-    // Consumes the session and returns the next one alongside the actions:
-    // transitions are moves between states, not writes into a borrowed
-    // self.
-    pub(super) fn on_datagram(
-        self,
-        data: &[u8],
-        from: SocketAddr,
-    ) -> Result<(Session, Vec<ConnectionAction>)> {
-        match self {
-            Session::Idle(state) => state.on_datagram(data, from),
-            Session::MasterHandshake(state) => state.on_datagram(data, from),
-            Session::P2PHandshaking(state) => state.on_datagram(data, from),
-            Session::Connected(state) => state.on_datagram(data, from),
-        }
-    }
+    state_dispatch!(Idle, MasterHandshake, P2PHandshaking, Connected);
 }
 
 #[cfg(test)]
@@ -495,5 +482,4 @@ mod tests {
             [ConnectionAction::Send { ref to, ref data }] if to == &peer_addr && data.len() == 0x18
         ));
     }
-
 }

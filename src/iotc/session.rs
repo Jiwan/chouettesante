@@ -231,7 +231,11 @@ mod tests {
 
     use std::{io::Cursor, net::Ipv4Addr};
 
-    use crate::{charlie_cypher, iotc::wire::*, utils::BinaryWriter};
+    use crate::{
+        charlie_cypher,
+        iotc::{constants::PACKET_HEADER_SIZE, wire::*},
+        utils::BinaryWriter,
+    };
 
     #[test]
     fn p2p_peer_credentials_are_cached_per_server_address() {
