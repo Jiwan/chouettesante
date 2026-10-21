@@ -97,7 +97,11 @@ fn make_p2p_init_packet(
             writer.write_le_u16(0)?;
             writer.write_bytes(&session.device_id)?;
             writer.write_le_u32(0)?; // *(undefined4 *)(p2p_config + 2)
-            writer.write_le_u64(0)?; // *(undefined8 *)*(byte **)(p2p_config + 4)
+            // *(undefined8 *)*(byte **)(p2p_config + 4): 8 bytes from
+            // session->field_0x11ac, filled from the UIDExtraData auth key
+            // the app passes to IOTC_Connect_ByUIDEx (connectWithAuth in the
+            // Owlet CameraSDK): the camera-kms auth_key.
+            writer.write_bytes(&session.auth_key)?;
             Ok(())
         },
         EXPECTED_CONTENT_SIZE,
@@ -463,7 +467,7 @@ mod tests {
 
     #[test]
     fn master_handshake_uses_the_common_record_layout() {
-        let session = SessionCore::new(0x12345678, "ABCDEFGHIJKLMNOPQRST");
+        let session = SessionCore::new(0x12345678, "ABCDEFGHIJKLMNOPQRST", *b"TESTKEY1");
 
         let record = make_record_send_master_handshake(&session).unwrap();
 

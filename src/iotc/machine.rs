@@ -2,8 +2,7 @@
 // machine, as a typestate.
 
 use std::{
-    net::SocketAddr,
-    time::{Duration, Instant},
+    fmt, net::SocketAddr, time::{Duration, Instant},
 };
 
 use anyhow::{bail, Result};
@@ -74,6 +73,17 @@ pub(super) enum Session {
     MasterHandshake(MasterHandshake),
     P2PHandshaking(P2PHandshaking),
     Connected(Connected),
+}
+
+impl fmt::Display for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Session::Idle(_) => write!(f, "Idle"),
+            Session::MasterHandshake(_) => write!(f, "MasterHandshake"),
+            Session::P2PHandshaking(_) => write!(f, "P2PHandshaking"),
+            Session::Connected(_) => write!(f, "Connected"),
+        }
+    }
 }
 
 impl Idle {
@@ -170,12 +180,7 @@ impl MasterHandshake {
             })
             .collect();
 
-        for (server, to) in servers.iter().zip(addrs) {
-            actions.push(ConnectionAction::Send {
-                data: make_record_send_p2p_init_handshake_req(&mut core, server)?,
-                to,
-            });
-        }
+        make_p2p_init_handshake_reqs(&servers, &mut core, &mut actions)?;
 
         Ok((
             P2PHandshaking {
@@ -189,6 +194,17 @@ impl MasterHandshake {
     }
 }
 
+fn make_p2p_init_handshake_reqs(servers: &[ServerEntry], core: &mut SessionCore, actions: &mut Vec<ConnectionAction>) -> Result<(), anyhow::Error> {
+    for server in servers {
+        actions.push(ConnectionAction::Send {
+            data: make_record_send_p2p_init_handshake_req(core, server)?,
+            to: SocketAddr::from((server.ip_address, server.port)),
+        });
+    }
+
+    Ok(())
+}
+
 impl P2PHandshaking {
     fn on_tick(&mut self) -> Result<Vec<ConnectionAction>> {
         let now = Instant::now();
@@ -197,19 +213,9 @@ impl P2PHandshaking {
             bail!("Timed out waiting for the P2P handshake response");
         }
 
-        // One record per candidate; this also creates the peers on the
-        // first pass (their credentials are cached afterwards). The
-        // servers and the crafting core are disjoint fields, so both may
-        // be borrowed at once.
-        self.servers
-            .iter()
-            .map(|server| {
-                Ok(ConnectionAction::Send {
-                    data: make_record_send_p2p_init_handshake_req(&mut self.core, server)?,
-                    to: SocketAddr::from((server.ip_address, server.port)),
-                })
-            })
-            .collect()
+        let mut actions = Vec::with_capacity(self.servers.len());
+        make_p2p_init_handshake_reqs(&self.servers, &mut self.core, &mut actions)?;
+        Ok(actions)
     }
 
     fn on_datagram(
@@ -338,9 +344,9 @@ macro_rules! state_dispatch {
 
 impl Session {
     // A fresh session, not yet connected.
-    pub(super) fn new(session_id: u32, uid: &str) -> Session {
+    pub(super) fn new(session_id: u32, uid: &str, auth_key: [u8; 8]) -> Session {
         Session::Idle(Idle {
-            core: SessionCore::new(session_id, uid),
+            core: SessionCore::new(session_id, uid, auth_key),
         })
     }
 
@@ -368,7 +374,7 @@ mod tests {
 
     #[test]
     fn connection_state_machine_transitions_through_the_phases() {
-        let core = SessionCore::new(1, "ABCDEFGHIJKLMNOPQRST");
+        let core = SessionCore::new(1, "ABCDEFGHIJKLMNOPQRST", *b"TESTKEY1");
         let session = Session::Idle(Idle { core });
         assert!(matches!(session, Session::Idle(_)));
 

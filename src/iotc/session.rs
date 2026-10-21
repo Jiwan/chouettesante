@@ -80,6 +80,9 @@ pub struct SessionCore {
     pub(super) nonce1: u16,
     pub(super) nonce2: u16,
     pub(super) ecdh_key: EcKey<openssl::pkey::Private>,
+    // From UIDExtraData/field_0x11ac in libIOTCAPIs.so: the 8-byte auth key
+    // (camera-kms auth_key) carried in the P2PInit packet content.
+    pub(super) auth_key: [u8; 8],
     // Mirrors Session.peers[0..0xb] in libIOTCAPIs.so: one set of P2P
     // credentials per server address.
     pub(super) peers: HashMap<SocketAddr, P2PPeer>,
@@ -88,8 +91,12 @@ pub struct SessionCore {
 }
 
 impl SessionCore {
-    pub(super) fn new(session_id: u32, uid: &str) -> Self {
-        let device_id: String = uid.to_lowercase();
+    pub(super) fn new(session_id: u32, uid: &str, auth_key: [u8; 8]) -> Self {
+        // From IOTC_Connect_UDP_Inner in libIOTCAPIs.so: the uid is
+        // normalized to uppercase (chars > 'Z' get 0x20 subtracted) before
+        // use, matching how the device registers itself with the P2P
+        // servers.
+        let device_id: String = uid.to_uppercase();
         let nonce1 = rand::random::<u16>();
         let nonce2 = rand::random::<u16>();
 
@@ -107,6 +114,7 @@ impl SessionCore {
             nonce1,
             nonce2,
             ecdh_key: generate_ecdh_key().unwrap(),
+            auth_key,
             peers: HashMap::new(),
             public_address: None,
         }
@@ -239,7 +247,7 @@ mod tests {
 
     #[test]
     fn p2p_peer_credentials_are_cached_per_server_address() {
-        let mut session = SessionCore::new(1, "ABCDEFGHIJKLMNOPQRST");
+        let mut session = SessionCore::new(1, "ABCDEFGHIJKLMNOPQRST", *b"TESTKEY1");
 
         let addr_a = SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 1111));
         let pub_a = test_public_key().unwrap();
@@ -262,7 +270,7 @@ mod tests {
 
     #[test]
     fn device_status_packet_flips_the_peer_state() {
-        let mut session = SessionCore::new(1, "ABCDEFGHIJKLMNOPQRST");
+        let mut session = SessionCore::new(1, "ABCDEFGHIJKLMNOPQRST", *b"TESTKEY1");
         let addr = SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 1111));
         let pub_key = test_public_key().unwrap();
         session.get_or_create_peer(&addr, &pub_key).unwrap();

@@ -74,10 +74,10 @@ impl IotcSessionManager {
         }
     }
 
-    fn create_session(&mut self, uid: &str) -> Session {
+    fn create_session(&mut self, uid: &str, auth_key: [u8; 8]) -> Session {
         self.session_id_counter += 1;
         let session_id = self.session_id_counter;
-        Session::new(session_id, uid)
+        Session::new(session_id, uid, auth_key)
     }
 
     fn take_session(&mut self, session_id: u32) -> Option<Session> {
@@ -85,11 +85,18 @@ impl IotcSessionManager {
     }
 }
 
-pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
+// The auth_key is the 8-byte camera-kms auth key, passed by the Owlet app to
+// IOTC_Connect_ByUIDEx as UIDExtraData (connectWithAuth in its CameraSDK).
+pub async fn connect(region: MasterRegion, uid: &str, auth_key: &str) -> Result<()> {
     // From IOTC_Connect_UDP_Inner in libIOTCAPIs.so.
 
+    let auth_key: [u8; 8] = auth_key
+        .as_bytes()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("The auth key must be exactly 8 bytes"))?;
+
     let mut session_manager = IotcSessionManager::new();
-    let session = session_manager.create_session(uid);
+    let session = session_manager.create_session(uid, auth_key);
 
     let master_domain_name = get_master_domain_name(region);
 
@@ -121,6 +128,7 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
         for action in actions {
             match action {
                 ConnectionAction::Send { data, to } => {
+                    debug!("Sending {} bytes to {}", data.len(), to);
                     socket.send_to(&data, to).await?;
                 }
                 ConnectionAction::Finished => {
@@ -136,8 +144,17 @@ pub async fn connect(region: MasterRegion, uid: &str) -> Result<()> {
         {
             Ok(Ok((data, from))) => {
                 debug!("Received {} bytes from {}", data.len(), from);
+
+                let old_state = session.to_string();
+
                 let (next, actions) = session.on_datagram(data, from)?;
                 session = next;
+
+                let new_state = session.to_string();
+                if (old_state != new_state) {
+                    debug!("State transition: {} -> {}", old_state, new_state);
+                }
+
                 actions
             }
             Ok(Err(e)) => return Err(e.into()),

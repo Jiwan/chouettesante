@@ -51,7 +51,12 @@ async fn main() -> Result<()> {
 
     debug!("Camera KMS response: {:?}", camera_kms_response);
 
-    connect(MasterRegion::EU, &camera_kms_response.tutkid).await?;
+    connect(
+        MasterRegion::EU,
+        &camera_kms_response.tutkid,
+        &camera_kms_response.auth_key,
+    )
+    .await?;
 
     Ok(())
 }
