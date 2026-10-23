@@ -15,18 +15,16 @@ use tracing::{debug, warn};
 
 use super::{
     constants,
-    crypto::decrypt_aes_128_gcm,
     get_realm,
     session::{P2PPeer, ParseOutcome, ServerEntry, SessionCore},
     wire::{
-        CmdType, PacketHeader, PacketOutcome, ParseError, RecordEncryption, RecordType,
-        make_record, parse_packet, write_packet,
+        CmdType, PacketHeader, PacketOutcome, RecordDecryption, RecordEncryption, RecordType,
+        write_record, parse_packet, read_packet_header_and_split, read_record_header_and_decrypt, write_packet,
     },
 };
 
 use crate::{
-    charlie_cypher,
-    utils::{BinaryReader, BinaryWriter},
+    charlie_cypher, iotc::wire::PacketFlags, utils::{BinaryReader, BinaryWriter},
 };
 
 pub(super) fn make_record_send_master_handshake(session: &SessionCore) -> Result<Vec<u8>> {
@@ -35,7 +33,7 @@ pub(super) fn make_record_send_master_handshake(session: &SessionCore) -> Result
     const EXPECTED_PACKET_SIZE: usize = 0x58;
     const EXPECTED_CONTENT_SIZE: usize = 0x48;
 
-    make_record(
+    write_record(
         RecordType::MasterHandshake,
         session.session_id,
         RECORD_SIZE,
@@ -48,10 +46,11 @@ pub(super) fn make_record_send_master_handshake(session: &SessionCore) -> Result
                 PacketHeader {
                     command: CmdType::P2PInitHandshakeReq as u16,
                     channel_id: 0,
-                    flags: 0,
+                    flags: PacketFlags::empty(),
                     command_options: 0x18,
                     session_id: 0,
                     channel_flags: 0,
+                    content_size: EXPECTED_CONTENT_SIZE as u16,
                 },
                 |writer| {
                     writer.write_le_u16(session.nonce1)?;
@@ -82,10 +81,11 @@ fn make_p2p_init_packet(
         PacketHeader {
             command: CmdType::P2PInit as u16,
             channel_id: 0,
-            flags: 0,
+            flags: PacketFlags::empty(),
             command_options: 0x24,
             session_id: 0,
             channel_flags: 0,
+            content_size: EXPECTED_CONTENT_SIZE as u16,
         },
         |writer| {
             // From iotcRecordSendP2PInitHandshakeReq (0x217 mode) in
@@ -124,7 +124,7 @@ pub(super) fn make_record_send_p2p_init_handshake_req(
     let der = session.ecdh_key.public_key_to_der()?;
     assert_eq!(der.len(), 0x5b, "ECDH DER key must be exactly 0x5B bytes");
 
-    make_record(
+    write_record(
         RecordType::P2PInitHandshakeReq,
         session.session_id,
         RECORD_SIZE,
@@ -157,10 +157,11 @@ pub(super) fn make_hello_server(session: &SessionCore) -> Result<Vec<u8>> {
         PacketHeader {
             command: CmdType::HelloServer as u16,
             channel_id: 0,
-            flags: 0x2,
+            flags: PacketFlags::from_bits_retain(0x2),
             command_options: 0x3f,
             session_id: 0,
             channel_flags: 0,
+            content_size: EXPECTED_CONTENT_SIZE as u16,
         },
         |writer| {
             writer.write_le_u32(sequence_number)?; // TODO: feels like some sequence number that is incremented each time. And randomized at start.
@@ -198,59 +199,42 @@ pub(super) fn make_record_send_p2p_keep_alive(record_sid: u32) -> Result<Vec<u8>
 }
 
 
-// Record parsing: the receive side, one helper per incoming record.
-
-fn parse_record_handshake<T>(
-    buffer: &[u8],
-    cursor: &mut Cursor<T>,
-    session: &SessionCore,
-) -> Result<Vec<ServerEntry>>
-where
-    T: AsRef<[u8]>,
-{
-    let record_size = cursor.read_le_u16()? as usize;
-    let session_id = cursor.read_le_u32()?;
-
-    assert!(session_id == session.session_id);
-
-    // Layout: header (aad) | payload | tag
-    // Size:     0x0c       |   ...   | 0x10
-    let add = &buffer[0..constants::RECORD_HEADER_SIZE];
-    let ciphertext = &buffer[constants::RECORD_HEADER_SIZE
-        ..constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE];
-    let tag =
-        &buffer[constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE..];
-    let result = decrypt_aes_128_gcm(ciphertext, add, tag, session.aes_key, session.aes_iv)?;
+// From the case 0x01 handler in iotcRecordHandler in libIOTCAPIs.so.
+fn parse_record_handshake(buffer: &[u8], session: &SessionCore) -> Result<Vec<ServerEntry>> {
+    let (header, payload) = read_record_header_and_decrypt(
+        buffer,
+        RecordDecryption::Aes128Gcm {
+            key: session.aes_key,
+            iv: session.aes_iv,
+        },
+    )?;
+    assert!(header.session_id == session.session_id);
 
     println!("Decrypted payload:");
-    crate::utils::hexdump(&result);
+    crate::utils::hexdump(&payload);
 
-    let mut payload_cursor = Cursor::new(&result);
-    let handshake_magic_number = payload_cursor.read_le_u16()?;
-    assert!(handshake_magic_number == constants::PACKET_MAGIC_NUMBER);
-    let _ = payload_cursor.read_u8()?;
-    let _ = payload_cursor.read_u8()?;
-    let len = payload_cursor.read_le_u32()?;
-    assert!(((len + 0x1c) as usize) < constants::RECORD_PACKET_MAX_SIZE);
-    let unknown = payload_cursor.read_le_u16()?;
-    assert!(unknown == 0x100c);
-    payload_cursor.seek_relative(6)?;
-    let nonce = payload_cursor.read_le_u16()?;
+    // The payload is a packet (cmd 0x100c) carrying the server list.
+    let (packet_header, content) = read_packet_header_and_split(&payload)?;
+    assert!(packet_header.command == CmdType::P2PInitHandshakeResp as u16);
+
+    let mut reader = Cursor::new(content);
+    let nonce = reader.read_le_u16()?;
     assert!(nonce == session.nonce1);
-    let _ = payload_cursor.read_le_u16()?;
-    let uid = payload_cursor.read_bytes::<20>()?;
+    let _ = reader.read_le_u16()?;
+    let uid = reader.read_bytes::<20>()?;
     assert!(uid == session.device_id);
 
-    payload_cursor.seek(std::io::SeekFrom::Start(0x4a))?;
-    let entry_count = payload_cursor.read_le_u16()?;
+    // The entry table starts at content offset 0x3a (payload offset 0x4a).
+    reader.seek(std::io::SeekFrom::Start(0x3a))?;
+    let entry_count = reader.read_le_u16()?;
     assert!(entry_count != 0);
 
     let mut servers = vec![];
 
     for _ in 0..entry_count {
-        let entry_type = payload_cursor.read_le_u16()?;
-        let entry_size = payload_cursor.read_le_u16()? as u64;
-        let entry_offset = payload_cursor.position();
+        let entry_type = reader.read_le_u16()?;
+        let entry_size = reader.read_le_u16()? as u64;
+        let entry_offset = reader.position();
 
         match entry_type {
             9 => {
@@ -258,13 +242,13 @@ where
                 let server_count = entry_size / 0x6C;
 
                 for _ in 0..server_count {
-                    let _ = payload_cursor.read_le_u16()?;
-                    let port = payload_cursor.read_be_u16()?;
-                    let ip_address: u32 = payload_cursor.read_be_u32()?;
-                    let _ = payload_cursor.read_le_u64()?;
+                    let _ = reader.read_le_u16()?;
+                    let port = reader.read_be_u16()?;
+                    let ip_address: u32 = reader.read_be_u32()?;
+                    let _ = reader.read_le_u64()?;
 
                     let mut der_key = [0; 0x5c];
-                    payload_cursor.read_exact(&mut der_key)?;
+                    reader.read_exact(&mut der_key)?;
                     let pub_key = PKey::public_key_from_der(&der_key)?;
 
                     servers.push(ServerEntry {
@@ -277,9 +261,9 @@ where
                 }
             }
             1 => {
-                let _unknown1 = payload_cursor.read_le_u16()?;
-                let _unknown2 = payload_cursor.read_le_u16()?;
-                let _unknown3 = payload_cursor.read_le_u16()?;
+                let _unknown1 = reader.read_le_u16()?;
+                let _unknown2 = reader.read_le_u16()?;
+                let _unknown3 = reader.read_le_u16()?;
                 // It looks like those 3 short are reversed: unknown3, unknown2, unknown1.
             }
             _ => {
@@ -287,36 +271,33 @@ where
             }
         }
 
-        payload_cursor.set_position(entry_offset + entry_size);
+        reader.set_position(entry_offset + entry_size);
     }
 
     Ok(servers)
 }
 
 // From the case '\x03' handler in iotcRecordHandler in libIOTCAPIs.so: the
-// response to the P2PInitHandshakeReq. Pure parse: validates against the
-// session (nonce2, device uid) and the peer credentials, and returns the
-// facts for the state machines to apply.
+// response to the P2PInitHandshakeReq, AES-GCM encrypted with the peer
+// keys. Pure parse: validates against the session (nonce2, device uid)
+// and returns the facts for the state machines to apply.
 fn parse_record_p2p_init_handshake_resp(
     buffer: &[u8],
-    record_size: usize,
     session: &SessionCore,
     from: SocketAddr,
 ) -> Result<(u32, u16)> {
-    // Layout: header (aad) | payload | tag
-    // Size:     0x0c         |   ...   | 0x10
-    let aad = &buffer[0..constants::RECORD_HEADER_SIZE];
-    let ciphertext = &buffer[constants::RECORD_HEADER_SIZE
-        ..constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE];
-    let tag =
-        &buffer[constants::RECORD_HEADER_SIZE + record_size - constants::RECORD_AES_TAG_SIZE..];
-
     let peer = session
         .peers
         .get(&from)
         .with_context(|| format!("Handshake response from an unknown peer: {}", from))?;
 
-    let packet = decrypt_aes_128_gcm(ciphertext, aad, tag, peer.aes_key, peer.aes_iv)?;
+    let (_, packet) = read_record_header_and_decrypt(
+        buffer,
+        RecordDecryption::Aes128Gcm {
+            key: peer.aes_key,
+            iv: peer.aes_iv,
+        },
+    )?;
 
     if packet.len() != 0x48 {
         warn!(
@@ -326,26 +307,17 @@ fn parse_record_p2p_init_handshake_resp(
         crate::utils::hexdump(&packet);
     }
 
-    let mut reader = Cursor::new(&packet);
-    let magic_number = reader.read_le_u16()?;
-    if magic_number != constants::PACKET_MAGIC_NUMBER {
-        return Err(ParseError::WrongPacketMagicNumber.into());
-    }
-    let _ = reader.read_u8()?; // Version.
-    let _ = reader.read_u8()?; // Flags.
-    let _content_size = reader.read_le_u16()? as usize;
-    let _ = reader.read_le_u16()?; // Unknown.
+    let (header, content) = read_packet_header_and_split(&packet)?;
 
-    let cmd_type = reader.read_le_u16()?;
-    if cmd_type != CmdType::P2PHandshake as u16 {
+    if header.command != CmdType::P2PHandshake as u16 {
         return Err(anyhow::anyhow!(
             "Unexpected handshake response cmd: 0x{:04x}",
-            cmd_type
+            header.command
         ));
     }
 
-    let mut content = Cursor::new(&packet[constants::PACKET_HEADER_SIZE..]);
-    let nonce2_echo = content.read_le_u16()?;
+    let mut reader = Cursor::new(content);
+    let nonce2_echo = reader.read_le_u16()?;
     if nonce2_echo != session.nonce2 {
         return Err(anyhow::anyhow!(
             "Wrong nonce2 in handshake response: 0x{:04x}",
@@ -353,9 +325,9 @@ fn parse_record_p2p_init_handshake_resp(
         ));
     }
 
-    let _ = content.read_le_u16()?;
-    let record_sid = content.read_le_u32()?;
-    let uid = content.read_bytes::<20>()?;
+    let _ = reader.read_le_u16()?;
+    let record_sid = reader.read_le_u32()?;
+    let uid = reader.read_bytes::<20>()?;
     if uid != session.device_id {
         return Err(anyhow::anyhow!(
             "Wrong device id in handshake response: {:?}",
@@ -364,7 +336,7 @@ fn parse_record_p2p_init_handshake_resp(
     }
 
     // Keepalive interval, in seconds, at content offset 0x34.
-    let keepalive_interval = Cursor::new(&packet[constants::PACKET_HEADER_SIZE + 0x34..]).read_le_u16()?;
+    let keepalive_interval = Cursor::new(&content[0x34..]).read_le_u16()?;
 
     debug!(
         "Handshake response accepted: record sid 0x{:08x}, keepalive interval {}s",
@@ -378,9 +350,8 @@ fn parse_record_p2p_init_handshake_resp(
 // server's keepalive, fully unencrypted. Pure parse: returns the echoed
 // record SID.
 fn parse_record_keep_alive(buffer: &[u8]) -> Result<u32> {
-    let mut reader: Cursor<&[u8]> = Cursor::new(buffer);
-    reader.set_position(constants::RECORD_HEADER_SIZE as u64);
-    let record_sid = reader.read_le_u32()?;
+    let (_, body) = read_record_header_and_decrypt(buffer, RecordDecryption::Unencrypted)?;
+    let record_sid = Cursor::new(&body).read_le_u32()?;
 
     debug!("Keepalive received (record sid 0x{:08x})", record_sid);
 
@@ -408,23 +379,21 @@ pub fn parse(
     }
 
     // Process as record
-    assert!(buffer.len() >= constants::RECORD_HEADER_SIZE);
-    assert!(buffer.len() <= constants::RECORD_PACKET_MAX_SIZE);
-
-    let mut cursor = Cursor::new(buffer);
-    let _ = cursor.read_le_u32()?; // magic number already read
-    let _ = cursor.read_u8()?; // version
-    let record_type: RecordType = cursor.read_u8()?.try_into()?;
-    let record_size = u16::from_le_bytes([buffer[6], buffer[7]]) as usize;
-
     let Some(session) = session else {
         warn!("Received a record without a session to attach it to");
         return Ok(ParseOutcome::Other);
     };
 
+    // Peek at the record type to dispatch; each record parser frames and
+    // decrypts its record with read_record.
+    let mut cursor = Cursor::new(buffer);
+    let _ = cursor.read_le_u32()?; // magic number already read
+    let _ = cursor.read_u8()?; // version
+    let record_type: RecordType = cursor.read_u8()?.try_into()?;
+
     match record_type {
         RecordType::MasterHandshake => {
-            let servers = parse_record_handshake(buffer, &mut cursor, session)?;
+            let servers = parse_record_handshake(buffer, session)?;
             Ok(ParseOutcome::ServerList(servers))
         }
         RecordType::P2PInitHandshakeResp => {
@@ -432,7 +401,7 @@ pub fn parse(
                 bail!("Received a handshake response without a source address");
             };
             let (record_sid, keepalive_interval) =
-                parse_record_p2p_init_handshake_resp(buffer, record_size, session, from)?;
+                parse_record_p2p_init_handshake_resp(buffer, session, from)?;
             Ok(ParseOutcome::HandshakeResp {
                 record_sid,
                 keepalive_interval,
@@ -465,6 +434,8 @@ pub fn parse(
 mod tests {
     use super::*;
 
+    use crate::iotc::session::test_public_key;
+
     #[test]
     fn master_handshake_uses_the_common_record_layout() {
         let session = SessionCore::new(0x12345678, "ABCDEFGHIJKLMNOPQRST", *b"TESTKEY1");
@@ -477,6 +448,159 @@ mod tests {
         assert_eq!(record[5], RecordType::MasterHandshake as u8);
         assert_eq!(&record[6..8], &0x100_u16.to_le_bytes());
         assert_eq!(&record[8..12], &session.session_id.to_le_bytes());
+    }
+
+    #[test]
+    fn keep_alive_record_round_trips_through_parse() {
+        let session = SessionCore::new(1, "ABCDEFGHIJKLMNOPQRST", *b"TESTKEY1");
+
+        let record = make_record_send_p2p_keep_alive(0xdeadbeef).unwrap();
+        let outcome = parse(&record, Some(&session), None).unwrap();
+
+        assert!(matches!(
+            outcome,
+            ParseOutcome::KeepAlive {
+                record_sid: 0xdeadbeef
+            }
+        ));
+    }
+
+    #[test]
+    fn p2p_init_handshake_resp_round_trips_through_parse() {
+        let mut session = SessionCore::new(1, "ABCDEFGHIJKLMNOPQRST", *b"TESTKEY1");
+        let peer_addr = SocketAddr::from((Ipv4Addr::new(5, 6, 7, 8), 3478));
+        let pub_key = test_public_key().unwrap();
+        let peer = session.get_or_create_peer(&peer_addr, &pub_key).unwrap();
+        let (aes_key, aes_iv) = (peer.aes_key, peer.aes_iv);
+
+        // The server's type 3 response: an AES-GCM record (peer keys)
+        // carrying a packet (cmd 0x218) that echoes nonce2, carries the
+        // record sid and the device uid, with the keepalive interval at
+        // content offset 0x34.
+        const CONTENT_SIZE: usize = 0x38;
+        const PACKET_SIZE: usize = constants::PACKET_HEADER_SIZE + CONTENT_SIZE;
+        const RECORD_SIZE: usize = PACKET_SIZE + constants::RECORD_AES_TAG_SIZE;
+
+        let record = write_record(
+            RecordType::P2PInitHandshakeResp,
+            session.session_id,
+            RECORD_SIZE,
+            PACKET_SIZE,
+            RecordEncryption::Aes128Gcm { key: aes_key, iv: aes_iv },
+            |_| Ok(()),
+            |writer| {
+                write_packet(
+                    writer,
+                    PacketHeader {
+                        command: CmdType::P2PHandshake as u16,
+                        channel_id: 0,
+                        flags: 0,
+                        command_options: 0,
+                        session_id: 0,
+                        channel_flags: 0,
+                    },
+                    |writer| {
+                        writer.write_le_u16(session.nonce2)?;
+                        writer.write_le_u16(0)?;
+                        writer.write_le_u32(0xdeadbeef)?;
+                        writer.write_bytes(&session.device_id)?;
+                        // Pad up to the keepalive interval at content offset 0x34.
+                        writer.write_bytes(&[0; 0x34 - 0x1c])?;
+                        writer.write_le_u16(42)?;
+                        writer.write_le_u16(0)?;
+                        Ok(())
+                    },
+                    CONTENT_SIZE,
+                )
+            },
+        )
+        .unwrap();
+
+        let outcome = parse(&record, Some(&session), Some(peer_addr)).unwrap();
+
+        assert!(matches!(
+            outcome,
+            ParseOutcome::HandshakeResp {
+                record_sid: 0xdeadbeef,
+                keepalive_interval: 42
+            }
+        ));
+    }
+
+    #[test]
+    fn master_handshake_resp_round_trips_through_parse() {
+        let session = SessionCore::new(0x12345678, "ABCDEFGHIJKLMNOPQRST", *b"TESTKEY1");
+
+        // The master's type 1 response: an AES-GCM record (session keys)
+        // carrying a packet (cmd 0x100c) that echoes nonce1 and the device
+        // uid, then a type 9 entry with one server candidate at content
+        // offset 0x3a.
+        let server_ip = Ipv4Addr::new(5, 6, 7, 8);
+        let server_port = 3478u16;
+        let der = test_public_key().unwrap().public_key_to_der().unwrap();
+
+        const CONTENT_SIZE: usize = 0x3a + 2 + 4 + 0x6c;
+        const PACKET_SIZE: usize = constants::PACKET_HEADER_SIZE + CONTENT_SIZE;
+        const RECORD_SIZE: usize = PACKET_SIZE + constants::RECORD_AES_TAG_SIZE;
+
+        let record = write_record(
+            RecordType::MasterHandshake,
+            session.session_id,
+            RECORD_SIZE,
+            PACKET_SIZE,
+            RecordEncryption::Aes128Gcm {
+                key: session.aes_key,
+                iv: session.aes_iv,
+            },
+            |_| Ok(()),
+            |writer| {
+                write_packet(
+                    writer,
+                    PacketHeader {
+                        command: CmdType::P2PInitHandshakeResp as u16,
+                        channel_id: 0,
+                        flags: 0,
+                        command_options: 0,
+                        session_id: 0,
+                        channel_flags: 0,
+                    },
+                    |writer| {
+                        writer.write_le_u16(session.nonce1)?;
+                        writer.write_le_u16(0)?;
+                        writer.write_bytes(&session.device_id)?;
+                        // Pad up to the entry table at content offset 0x3a.
+                        writer.write_bytes(&[0; 0x3a - 0x18])?;
+                        writer.write_le_u16(1)?; // One entry.
+                        // The type 9 entry: the server list.
+                        writer.write_le_u16(9)?;
+                        writer.write_le_u16(0x6c)?;
+                        writer.write_le_u16(0)?;
+                        writer.write_be_u16(server_port)?;
+                        writer.write_be_u32(u32::from(server_ip))?;
+                        writer.write_le_u64(0)?;
+                        let mut der_key = [0; 0x5c];
+                        der_key[..der.len()].copy_from_slice(&der);
+                        writer.write_bytes(&der_key)?;
+                        Ok(())
+                    },
+                    CONTENT_SIZE,
+                )?;
+                // The master server sends its response packet with version
+                // 0x1d, not PACKET_VERSION.
+                writer.get_mut()[2] = 0x1d;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let outcome = parse(&record, Some(&session), None).unwrap();
+
+        let ParseOutcome::ServerList(servers) = outcome else {
+            panic!("Expected a server list");
+        };
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].ip_address, IpAddr::V4(server_ip));
+        assert_eq!(servers[0].port, server_port);
     }
 
 }
