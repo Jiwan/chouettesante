@@ -13,7 +13,8 @@ use super::{
         make_hello_server, make_record_send_master_handshake,
         make_record_send_p2p_init_handshake_req, make_record_send_p2p_keep_alive, parse,
     },
-    session::{ParseOutcome, PeerState, ServerEntry, SessionCore},
+    session::{ParseOutcome, PeerState, SessionCore},
+    wire::ServerEntry,
 };
 
 #[derive(Debug)]

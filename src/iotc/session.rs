@@ -4,7 +4,7 @@
 
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     time::Instant,
 };
 
@@ -16,7 +16,10 @@ use openssl::{
 use anyhow::Result;
 use tracing::{debug, warn};
 
-use super::crypto::{derive_aes_128_key, generate_ecdh_key};
+use super::{
+    crypto::{derive_aes_128_key, generate_ecdh_key},
+    wire::ServerEntry,
+};
 
 // Mirrors the per-server state in the Session server table (state byte at
 // +0x7e7) in libIOTCAPIs.so: one machine per server peer, tracking how the
@@ -41,13 +44,6 @@ pub(super) struct P2PPeer {
     pub(super) aes_key: [u8; 16],
     pub(super) aes_iv: [u8; 12],
     pub(super) state: PeerState,
-}
-
-#[derive(Debug, Clone)]
-pub struct ServerEntry {
-    pub(super) ip_address: IpAddr,
-    pub(super) port: u16,
-    pub(super) pub_key: PKey<Public>,
 }
 
 #[derive(Debug)]
@@ -284,10 +280,11 @@ mod tests {
             PacketHeader {
                 command: CmdType::DeviceOfflineStatus as u16,
                 channel_id: 0,
-                flags: 0,
+                flags: PacketFlags::empty(),
                 command_options: 0,
                 session_id: 0,
                 channel_flags: 0,
+                content_size: 20,
             },
             |writer| {
                 writer.write_bytes(&session.device_id)?;
@@ -298,14 +295,12 @@ mod tests {
         .unwrap();
         charlie_cypher::cypher(&mut packet);
 
-        let outcome = parse_packet(&packet).unwrap();
-        assert_eq!(
-            outcome,
-            PacketOutcome::DeviceStatus {
-                online: false,
-                uid: session.device_id
-            }
-        );
+        let outcome = parse_packet(&packet, PacketCypher::Charlie).unwrap();
+        let PacketOutcome::DeviceStatus { online, uid } = outcome else {
+            panic!("Expected a DeviceStatus outcome");
+        };
+        assert!(!online);
+        assert_eq!(uid, session.device_id);
 
         // The peer machine applies the fact; the main machine is not
         // affected by a device status.

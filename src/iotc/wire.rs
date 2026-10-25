@@ -1,15 +1,16 @@
 // The wire format: the packet and record framing shared by every message,
-// the command ids, and the standalone packet parser. Knows nothing about
-// sessions.
+// the command ids, and the packet parser. Knows nothing about sessions.
 
 use std::{
-    io::Cursor,
+    borrow::Cow,
+    io::{Cursor, Read, Seek},
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
 use anyhow::{Context, Result};
 use bitflags::bitflags;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use openssl::pkey::{PKey, Public};
 use thiserror::Error;
 use tracing::{debug, warn};
 
@@ -236,18 +237,13 @@ pub(super) fn read_packet_header(buffer: &[u8]) -> Result<PacketHeader> {
         })
 }
 
-pub(super) fn read_packet_header_and_split(buffer: &[u8]) -> Result<(PacketHeader, &[u8])> {
-    let (header, content) = buffer
-        .split_at_checked(constants::PACKET_HEADER_SIZE)
-        .context(ParseError::InvalidHeaderSize)?;
-
-    let header = read_packet_header(header)?;
-
-    if content.len() != header.content_size as usize {
-        return Err(ParseError::InvalidPacketContentSize.into());
-    }
-
-    Ok((header, content))
+pub(super) enum PacketCypher {
+    // A standalone packet: the header is charlie-cyphered, and so is the
+    // content — fully, or only its first 0x30 bytes when the
+    // CypherExtendHeaderOnly flag is set (charlie_crypt clamps the cyphered
+    // size to the buffer size).
+    Charlie,
+    Plaintext,
 }
 
 pub(super) fn write_record<WriteExtendedHeader, WritePayload>(
@@ -362,7 +358,7 @@ impl RecordDecryption {
 //
 // Offset  Size  Field
 // 0x00    4     Magic number (RECORD_MAGIC_NUMBER, 0xcc51)
-// 0x04    1     Version (make_record writes 1)
+// 0x04    1     Version (write_record writes 1)
 // 0x05    1     Record type (RecordType)
 // 0x06    2     Record size (the body size, ciphertext and tag included)
 // 0x08    4     Session id
@@ -416,50 +412,74 @@ pub(super) fn read_record_header_and_decrypt(
     Ok((header, payload))
 }
 
-// The parsed facts of a standalone packet (not wrapped in a record), from
-// _IOTC_Packet_Handler in libIOTCAPIs.so. Parsing stays pure: the state
-// machines apply these facts.
-#[derive(Debug, PartialEq)]
+// A P2P server candidate, as carried by the type 9 entries of the master
+// handshake response (cmd 0x100c).
+#[derive(Debug)]
+pub struct ServerEntry {
+    pub(super) ip_address: IpAddr,
+    pub(super) port: u16,
+    pub(super) pub_key: PKey<Public>,
+}
+
+#[derive(Debug)]
 pub(super) enum PacketOutcome {
     HelloClient { address: SocketAddr },
     DeviceStatus { online: bool, uid: [u8; 20] },
+    P2PHandshake {
+        nonce2: u16,
+        uid: [u8; 20],
+        record_sid: u32,
+        keepalive_interval: u16,
+    },
+    ServerList {
+        nonce1: u16,
+        uid: [u8; 20],
+        servers: Vec<ServerEntry>,
+    },
     Ignored,
 }
 
-pub fn parse_packet(buffer: &[u8]) -> Result<PacketOutcome> {
-    let buffer_len = buffer.len();
+pub(super) fn parse_packet(buffer: &[u8], cypher: PacketCypher) -> Result<PacketOutcome> {
     let (header, content) = buffer
         .split_at_checked(constants::PACKET_HEADER_SIZE)
         .context(ParseError::InvalidHeaderSize)?;
 
-    let mut header = header.to_vec();
-    decypher(&mut header);
+    // Charlie decyphers in place and needs an owned buffer; Plaintext
+    // borrows the datagram slices as-is.
+    let mut header = match cypher {
+        PacketCypher::Charlie => Cow::Owned(header.to_vec()),
+        PacketCypher::Plaintext => Cow::Borrowed(header),
+    };
+    let mut content= match cypher {
+        PacketCypher::Charlie => Cow::Owned(content.to_vec()),
+        PacketCypher::Plaintext => Cow::Borrowed(content),
+    };
+
+    if let PacketCypher::Charlie = cypher {
+        decypher(header.to_mut());
+    }
 
     let packet_header = read_packet_header(&header)?;
 
-    // From FUN_0004a770 in libIOTCAPIs.so: a packet is only processed when
-    // the datagram is exactly the header plus the announced content size;
-    // anything else is silently dropped.
-    if packet_header.content_size as usize + constants::PACKET_HEADER_SIZE != buffer_len {
-        warn!(
-            "Dropping packet with inconsistent size: {} + 0x{:x} != {}",
-            packet_header.content_size, constants::PACKET_HEADER_SIZE, buffer_len
-        );
-        return Ok(PacketOutcome::Ignored);
+    if let PacketCypher::Charlie = cypher {
+        let cyphered_size = if packet_header.flags.contains(PacketFlags::CypherExtendHeaderOnly) {
+            0x30.min(content.len())
+        } else {
+            content.len()
+        };
+
+        decypher(&mut content.to_mut()[..cyphered_size]);
     }
 
-    // When the CypherExtendHeaderOnly flag is set, only the first 0x30
-    // content bytes are cyphered — but if the content is shorter than that,
-    // the whole content is cyphered (charlie_crypt clamps cryptedSize to
-    // the buffer size).
-    let cyphered_size = if packet_header.flags.contains(PacketFlags::CypherExtendHeaderOnly) {
-        0x30.min(content.len())
-    } else {
-        content.len()
-    };
-
-    let mut content = content.to_vec();
-    decypher(&mut content[..cyphered_size]);
+    // A packet is exactly the header plus the announced content size.
+    if content.len() != packet_header.content_size as usize {
+        warn!(
+            "Packet content size mismatch: announced {}, got {}",
+            packet_header.content_size,
+            content.len()
+        );
+        return Err(ParseError::InvalidPacketContentSize.into());
+    }
 
     // From: _IOTC_Packet_Handler in libIOTCAPIs.so
     let cmd_type_enum = match CmdType::try_from(packet_header.command) {
@@ -470,7 +490,7 @@ pub fn parse_packet(buffer: &[u8]) -> Result<PacketOutcome> {
         }
     };
 
-    let mut reader: Cursor<&[u8]> = Cursor::new(content.as_slice());
+    let mut reader: Cursor<&[u8]> = Cursor::new(&content[..]);
 
     match cmd_type_enum {
         CmdType::UnknownCmd0x408 => {
@@ -511,10 +531,94 @@ pub fn parse_packet(buffer: &[u8]) -> Result<PacketOutcome> {
                 // Supplied to a SslStream: https://docs.rs/openssl/0.10.71/openssl/ssl/index.html
             }
         }
-        CmdType::P2PInit | CmdType::P2PInitHandshakeReq | CmdType::P2PInitHandshakeResp => {
+        CmdType::P2PInit | CmdType::P2PInitHandshakeReq => {
             debug!("Received P2P handshake packet");
         }
-        CmdType::P2PHandshake | CmdType::KeyPush => {
+        CmdType::P2PHandshake => {
+            // The response to the P2PInitHandshakeReq, carried by a type 3
+            // record: the nonce2 echo, the record sid, the device uid, and
+            // the keepalive interval at content offset 0x34.
+            if content.len() < 0x36 {
+                return Err(ParseError::InvalidPacketContentSize.into());
+            }
+
+            let nonce2 = reader.read_le_u16()?;
+            let _ = reader.read_le_u16()?;
+            let record_sid = reader.read_le_u32()?;
+            let uid = reader.read_bytes::<20>()?;
+            let keepalive_interval = Cursor::new(&content[0x34..]).read_le_u16()?;
+
+            return Ok(PacketOutcome::P2PHandshake {
+                nonce2,
+                uid,
+                record_sid,
+                keepalive_interval,
+            });
+        }
+        CmdType::P2PInitHandshakeResp => {
+            // The master handshake response, carried by a type 1 record:
+            // the nonce1 echo, the device uid, then the entry table at
+            // content offset 0x3a.
+            let nonce1 = reader.read_le_u16()?;
+            let _ = reader.read_le_u16()?;
+            let uid = reader.read_bytes::<20>()?;
+
+            reader.seek(std::io::SeekFrom::Start(0x3a))?;
+            let entry_count = reader.read_le_u16()?;
+            assert!(entry_count != 0);
+
+            let mut servers = vec![];
+
+            for _ in 0..entry_count {
+                let entry_type = reader.read_le_u16()?;
+                let entry_size = reader.read_le_u16()? as u64;
+                let entry_offset = reader.position();
+
+                match entry_type {
+                    9 => {
+                        /* server entries or something */
+                        let server_count = entry_size / 0x6C;
+
+                        for _ in 0..server_count {
+                            let _ = reader.read_le_u16()?;
+                            let port = reader.read_be_u16()?;
+                            let ip_address: u32 = reader.read_be_u32()?;
+                            let _ = reader.read_le_u64()?;
+
+                            let mut der_key = [0; 0x5c];
+                            reader.read_exact(&mut der_key)?;
+                            let pub_key = PKey::public_key_from_der(&der_key)?;
+
+                            servers.push(ServerEntry {
+                                ip_address: IpAddr::V4(Ipv4Addr::from_bits(ip_address)),
+                                port,
+                                pub_key,
+                            });
+
+                            debug!("Server: {:?}", servers.last());
+                        }
+                    }
+                    1 => {
+                        let _unknown1 = reader.read_le_u16()?;
+                        let _unknown2 = reader.read_le_u16()?;
+                        let _unknown3 = reader.read_le_u16()?;
+                        // It looks like those 3 short are reversed: unknown3, unknown2, unknown1.
+                    }
+                    _ => {
+                        warn!("Unknown entry type: {}", entry_type);
+                    }
+                }
+
+                reader.set_position(entry_offset + entry_size);
+            }
+
+            return Ok(PacketOutcome::ServerList {
+                nonce1,
+                uid,
+                servers,
+            });
+        }
+        CmdType::KeyPush => {
             debug!("Received P2P session packet");
         }
         CmdType::DeviceOfflineStatus | CmdType::DeviceOnlineStatus => {
@@ -569,10 +673,11 @@ mod tests {
             PacketHeader {
                 command: 0x1234,
                 channel_id: 0x56,
-                flags: 0x78,
+                flags: PacketFlags::from_bits_retain(0x78),
                 command_options: 0xdef0,
                 session_id: 0x9abc,
                 channel_flags: 0x12,
+                content_size: 3,
             },
             |writer| {
                 writer.write_bytes(&[0xaa, 0xbb, 0xcc])?;
@@ -619,7 +724,7 @@ mod tests {
             PacketHeader {
                 command: 0,
                 channel_id: 0,
-                flags: 0,
+                flags: PacketFlags::empty(),
                 command_options: 0,
                 session_id: 0,
                 channel_flags: 0,
@@ -635,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn read_packet_parses_what_write_packet_writes() {
+    fn read_packet_header_parses_what_write_packet_writes() {
         let mut buffer = [0; 32];
         let mut writer = Cursor::new(buffer.as_mut_slice());
 
@@ -644,7 +749,7 @@ mod tests {
             PacketHeader {
                 command: 0x1234,
                 channel_id: 0x56,
-                flags: 0x78,
+                flags: PacketFlags::from_bits_retain(0x78),
                 command_options: 0xdef0,
                 session_id: 0x9abc,
                 channel_flags: 0x12,
@@ -658,16 +763,15 @@ mod tests {
         )
         .unwrap();
 
-        let packet = &buffer[..constants::PACKET_HEADER_SIZE + 3];
-        let (header, content) = read_packet_header_and_split(packet).unwrap();
+        let header = read_packet_header(&buffer[..constants::PACKET_HEADER_SIZE]).unwrap();
 
         assert_eq!(header.command, 0x1234);
         assert_eq!(header.channel_id, 0x56);
-        assert_eq!(header.flags, 0x78);
+        assert_eq!(header.flags.bits(), 0x78);
         assert_eq!(header.command_options, 0xdef0);
         assert_eq!(header.session_id, 0x9abc);
         assert_eq!(header.channel_flags, 0x12);
-        assert_eq!(content, &[0xaa, 0xbb, 0xcc]);
+        assert_eq!(header.content_size, 3);
     }
 
     #[test]
@@ -680,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn read_packet_accepts_record_embedded_packet_versions() {
+    fn parse_packet_accepts_record_embedded_packet_versions() {
         // The master handshake response carries its packet with version
         // 0x1d, not PACKET_VERSION (0x1e): the version byte is never
         // enforced when parsing.
@@ -688,9 +792,8 @@ mod tests {
         packet[0..2].copy_from_slice(&constants::PACKET_MAGIC_NUMBER.to_le_bytes());
         packet[2] = 0x1d;
 
-        let (header, content) = read_packet_header_and_split(&packet).unwrap();
-        assert_eq!(header.command, 0);
-        assert!(content.is_empty());
+        let outcome = parse_packet(&packet, PacketCypher::Plaintext).unwrap();
+        assert!(matches!(outcome, PacketOutcome::Ignored));
     }
 
     #[test]
@@ -708,7 +811,7 @@ mod tests {
                 PacketHeader {
                     command: CmdType::HelloClient as u16,
                     channel_id: 0,
-                    flags: 0,
+                    flags: PacketFlags::empty(),
                     command_options: 0,
                     session_id: 0,
                     channel_flags: 0,
@@ -728,12 +831,15 @@ mod tests {
         packet[2] = 0x1f;
         crate::charlie_cypher::cypher(&mut packet);
 
-        let outcome = parse_packet(&packet).unwrap();
-        assert_eq!(outcome, PacketOutcome::HelloClient { address });
+        let outcome = parse_packet(&packet, PacketCypher::Charlie).unwrap();
+        let PacketOutcome::HelloClient { address: parsed } = outcome else {
+            panic!("Expected a HelloClient outcome");
+        };
+        assert_eq!(parsed, address);
     }
 
     #[test]
-    fn read_packet_rejects_an_announced_content_size_mismatch() {
+    fn parse_packet_rejects_an_announced_content_size_mismatch() {
         let mut buffer = [0; 32];
         let mut writer = Cursor::new(buffer.as_mut_slice());
 
@@ -742,7 +848,7 @@ mod tests {
             PacketHeader {
                 command: 0,
                 channel_id: 0,
-                flags: 0,
+                flags: PacketFlags::empty(),
                 command_options: 0,
                 session_id: 0,
                 channel_flags: 0,
@@ -758,12 +864,117 @@ mod tests {
 
         // Truncate the content: the announced size no longer matches.
         let packet = &buffer[..constants::PACKET_HEADER_SIZE + 2];
-        let err = read_packet_header_and_split(packet).err().unwrap();
+        let err = parse_packet(packet, PacketCypher::Plaintext)
+            .err()
+            .unwrap();
         assert_eq!(err.to_string(), "InvalidPacketContentSize");
     }
 
     #[test]
-    fn read_record_decrypts_what_make_record_encrypts() {
+    fn parse_packet_parses_a_p2p_handshake_packet() {
+        // A P2PHandshake packet (cmd 0x218) as embedded in the type 3
+        // handshake response record.
+        let uid = [0x42; 20];
+
+        let mut packet = vec![0u8; constants::PACKET_HEADER_SIZE + 0x36];
+        {
+            let mut writer = Cursor::new(packet.as_mut_slice());
+            write_packet(
+                &mut writer,
+                PacketHeader {
+                    command: CmdType::P2PHandshake as u16,
+                    channel_id: 0,
+                    flags: PacketFlags::empty(),
+                    command_options: 0,
+                    session_id: 0,
+                    channel_flags: 0,
+                    content_size: 0x36,
+                },
+                |writer| {
+                    writer.write_le_u16(0x1234)?; // nonce2
+                    writer.write_le_u16(0)?;
+                    writer.write_le_u32(0xdeadbeef)?; // record sid
+                    writer.write_bytes(&uid)?;
+                    writer.write_bytes(&[0; 0x34 - 0x1c])?; // pad up to offset 0x34
+                    writer.write_le_u16(257)?; // keepalive interval
+                    Ok(())
+                },
+                0x36,
+            )
+            .unwrap();
+        }
+
+        let outcome = parse_packet(&packet, PacketCypher::Plaintext).unwrap();
+        let PacketOutcome::P2PHandshake {
+            nonce2,
+            uid: parsed_uid,
+            record_sid,
+            keepalive_interval,
+        } = outcome
+        else {
+            panic!("Expected a P2PHandshake outcome");
+        };
+        assert_eq!(nonce2, 0x1234);
+        assert_eq!(parsed_uid, uid);
+        assert_eq!(record_sid, 0xdeadbeef);
+        assert_eq!(keepalive_interval, 257);
+    }
+
+    #[test]
+    fn parse_packet_decyphers_only_the_extended_header_of_a_charlie_packet() {
+        // With CypherExtendHeaderOnly, only the first 0x30 content bytes
+        // are cyphered (charlie_crypt clamps the cyphered size to the
+        // buffer size); the rest of the content stays plaintext. The
+        // keepalive interval sits at content offset 0x34 — past the
+        // cyphered prefix — so it proves the tail was left alone.
+        let uid = [0x42; 20];
+        const CONTENT_SIZE: usize = 0x36;
+
+        let mut packet = vec![0u8; constants::PACKET_HEADER_SIZE + CONTENT_SIZE];
+        {
+            let mut writer = Cursor::new(packet.as_mut_slice());
+            write_packet(
+                &mut writer,
+                PacketHeader {
+                    command: CmdType::P2PHandshake as u16,
+                    channel_id: 0,
+                    flags: PacketFlags::CypherExtendHeaderOnly,
+                    command_options: 0,
+                    session_id: 0,
+                    channel_flags: 0,
+                    content_size: CONTENT_SIZE as u16,
+                },
+                |writer| {
+                    writer.write_le_u16(0x1234)?; // nonce2
+                    writer.write_le_u16(0)?;
+                    writer.write_le_u32(0xdeadbeef)?; // record sid
+                    writer.write_bytes(&uid)?;
+                    writer.write_bytes(&[0; 0x34 - 0x1c])?; // pad up to offset 0x34
+                    writer.write_le_u16(257)?; // keepalive interval
+                    Ok(())
+                },
+                CONTENT_SIZE,
+            )
+            .unwrap();
+        }
+
+        // Cypher only what the server would cypher: the header plus the
+        // first 0x30 content bytes.
+        let cyphered_size = constants::PACKET_HEADER_SIZE + 0x30;
+        crate::charlie_cypher::cypher(&mut packet[..cyphered_size]);
+
+        let outcome = parse_packet(&packet, PacketCypher::Charlie).unwrap();
+        let PacketOutcome::P2PHandshake {
+            keepalive_interval, ..
+        } = outcome
+        else {
+            panic!("Expected a P2PHandshake outcome");
+        };
+        assert_eq!(keepalive_interval, 257);
+    }
+
+    #[test]
+    fn read_record_decrypts_what_write_record_encrypts() {
         let key = [0x42; 16];
         let iv = [0x24; 12];
         const PAYLOAD_SIZE: usize = 5;

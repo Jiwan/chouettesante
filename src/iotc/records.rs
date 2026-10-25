@@ -3,12 +3,7 @@
 // minute from the session; the receive side is a pure parse producing
 // ParseOutcome facts for the state machines to apply.
 
-use std::{
-    io::{Cursor, Read, Seek},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-};
-
-use openssl::pkey::PKey;
+use std::{io::Cursor, net::SocketAddr};
 
 use anyhow::{Context, Result, bail};
 use tracing::{debug, warn};
@@ -16,10 +11,11 @@ use tracing::{debug, warn};
 use super::{
     constants,
     get_realm,
-    session::{P2PPeer, ParseOutcome, ServerEntry, SessionCore},
+    session::{P2PPeer, ParseOutcome, SessionCore},
     wire::{
-        CmdType, PacketHeader, PacketOutcome, RecordDecryption, RecordEncryption, RecordType,
-        write_record, parse_packet, read_packet_header_and_split, read_record_header_and_decrypt, write_packet,
+        CmdType, PacketCypher, PacketHeader, PacketOutcome, ParseError, RecordDecryption,
+        RecordEncryption, RecordType, ServerEntry, parse_packet, read_record_header_and_decrypt,
+        write_packet, write_record,
     },
 };
 
@@ -210,69 +206,18 @@ fn parse_record_handshake(buffer: &[u8], session: &SessionCore) -> Result<Vec<Se
     )?;
     assert!(header.session_id == session.session_id);
 
-    println!("Decrypted payload:");
-    crate::utils::hexdump(&payload);
-
-    // The payload is a packet (cmd 0x100c) carrying the server list.
-    let (packet_header, content) = read_packet_header_and_split(&payload)?;
-    assert!(packet_header.command == CmdType::P2PInitHandshakeResp as u16);
-
-    let mut reader = Cursor::new(content);
-    let nonce = reader.read_le_u16()?;
-    assert!(nonce == session.nonce1);
-    let _ = reader.read_le_u16()?;
-    let uid = reader.read_bytes::<20>()?;
-    assert!(uid == session.device_id);
-
-    // The entry table starts at content offset 0x3a (payload offset 0x4a).
-    reader.seek(std::io::SeekFrom::Start(0x3a))?;
-    let entry_count = reader.read_le_u16()?;
-    assert!(entry_count != 0);
-
-    let mut servers = vec![];
-
-    for _ in 0..entry_count {
-        let entry_type = reader.read_le_u16()?;
-        let entry_size = reader.read_le_u16()? as u64;
-        let entry_offset = reader.position();
-
-        match entry_type {
-            9 => {
-                /* server entries or something */
-                let server_count = entry_size / 0x6C;
-
-                for _ in 0..server_count {
-                    let _ = reader.read_le_u16()?;
-                    let port = reader.read_be_u16()?;
-                    let ip_address: u32 = reader.read_be_u32()?;
-                    let _ = reader.read_le_u64()?;
-
-                    let mut der_key = [0; 0x5c];
-                    reader.read_exact(&mut der_key)?;
-                    let pub_key = PKey::public_key_from_der(&der_key)?;
-
-                    servers.push(ServerEntry {
-                        ip_address: IpAddr::V4(Ipv4Addr::from_bits(ip_address)),
-                        port,
-                        pub_key,
-                    });
-
-                    debug!("Server: {:?}", servers.last());
-                }
-            }
-            1 => {
-                let _unknown1 = reader.read_le_u16()?;
-                let _unknown2 = reader.read_le_u16()?;
-                let _unknown3 = reader.read_le_u16()?;
-                // It looks like those 3 short are reversed: unknown3, unknown2, unknown1.
-            }
-            _ => {
-                warn!("Unknown entry type: {}", entry_type);
-            }
+    let servers = match parse_packet(&payload, PacketCypher::Plaintext)? {
+        PacketOutcome::ServerList {
+            nonce1,
+            uid,
+            servers,
+        } => {
+            assert!(nonce1 == session.nonce1);
+            assert!(uid == session.device_id);
+            servers
         }
-
-        reader.set_position(entry_offset + entry_size);
-    }
+        outcome => bail!("Unexpected packet in the master handshake response: {:?}", outcome),
+    };
 
     Ok(servers)
 }
@@ -307,36 +252,23 @@ fn parse_record_p2p_init_handshake_resp(
         crate::utils::hexdump(&packet);
     }
 
-    let (header, content) = read_packet_header_and_split(&packet)?;
-
-    if header.command != CmdType::P2PHandshake as u16 {
-        return Err(anyhow::anyhow!(
-            "Unexpected handshake response cmd: 0x{:04x}",
-            header.command
-        ));
-    }
-
-    let mut reader = Cursor::new(content);
-    let nonce2_echo = reader.read_le_u16()?;
-    if nonce2_echo != session.nonce2 {
-        return Err(anyhow::anyhow!(
-            "Wrong nonce2 in handshake response: 0x{:04x}",
-            nonce2_echo
-        ));
-    }
-
-    let _ = reader.read_le_u16()?;
-    let record_sid = reader.read_le_u32()?;
-    let uid = reader.read_bytes::<20>()?;
-    if uid != session.device_id {
-        return Err(anyhow::anyhow!(
-            "Wrong device id in handshake response: {:?}",
-            uid
-        ));
-    }
-
-    // Keepalive interval, in seconds, at content offset 0x34.
-    let keepalive_interval = Cursor::new(&content[0x34..]).read_le_u16()?;
+    let (record_sid, keepalive_interval) = match parse_packet(&packet, PacketCypher::Plaintext)? {
+        PacketOutcome::P2PHandshake {
+            nonce2,
+            uid,
+            record_sid,
+            keepalive_interval,
+        } => {
+            if nonce2 != session.nonce2 {
+                bail!("Wrong nonce2 in handshake response: 0x{:04x}", nonce2);
+            }
+            if uid != session.device_id {
+                bail!("Wrong device id in handshake response: {:?}", uid);
+            }
+            (record_sid, keepalive_interval)
+        }
+        outcome => bail!("Unexpected packet in the handshake response: {:?}", outcome),
+    };
 
     debug!(
         "Handshake response accepted: record sid 0x{:08x}, keepalive interval {}s",
@@ -368,13 +300,28 @@ pub fn parse(
     let record_magic_number = buf.read_le_u32()?;
 
     if record_magic_number != constants::RECORD_MAGIC_NUMBER {
-        // Process as packet
-        return match parse_packet(buffer)? {
+        // Process as packet. From FUN_0004a770 in libIOTCAPIs.so: a
+        // standalone packet is only processed when the datagram is exactly
+        // the header plus the announced content size; anything else is
+        // silently dropped.
+        let outcome = match parse_packet(buffer, PacketCypher::Charlie) {
+            Ok(outcome) => outcome,
+            Err(err)
+                if matches!(
+                    err.downcast_ref::<ParseError>(),
+                    Some(ParseError::InvalidPacketContentSize)
+                ) =>
+            {
+                return Ok(ParseOutcome::Packet)
+            }
+            Err(err) => return Err(err),
+        };
+        return match outcome {
             PacketOutcome::HelloClient { address } => Ok(ParseOutcome::HelloClient { address }),
             PacketOutcome::DeviceStatus { online, uid } => {
                 Ok(ParseOutcome::DeviceStatus { online, uid })
             }
-            PacketOutcome::Ignored => Ok(ParseOutcome::Packet),
+            _ => Ok(ParseOutcome::Packet),
         };
     }
 
@@ -385,7 +332,7 @@ pub fn parse(
     };
 
     // Peek at the record type to dispatch; each record parser frames and
-    // decrypts its record with read_record.
+    // decrypts its record with read_record_header_and_decrypt.
     let mut cursor = Cursor::new(buffer);
     let _ = cursor.read_le_u32()?; // magic number already read
     let _ = cursor.read_u8()?; // version
@@ -433,6 +380,8 @@ pub fn parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::net::{IpAddr, Ipv4Addr};
 
     use crate::iotc::session::test_public_key;
 
@@ -494,10 +443,11 @@ mod tests {
                     PacketHeader {
                         command: CmdType::P2PHandshake as u16,
                         channel_id: 0,
-                        flags: 0,
+                        flags: PacketFlags::empty(),
                         command_options: 0,
                         session_id: 0,
                         channel_flags: 0,
+                        content_size: CONTENT_SIZE as u16,
                     },
                     |writer| {
                         writer.write_le_u16(session.nonce2)?;
@@ -559,10 +509,11 @@ mod tests {
                     PacketHeader {
                         command: CmdType::P2PInitHandshakeResp as u16,
                         channel_id: 0,
-                        flags: 0,
+                        flags: PacketFlags::empty(),
                         command_options: 0,
                         session_id: 0,
                         channel_flags: 0,
+                        content_size: CONTENT_SIZE as u16,
                     },
                     |writer| {
                         writer.write_le_u16(session.nonce1)?;
