@@ -439,6 +439,106 @@ pub(super) enum PacketOutcome {
     Ignored,
 }
 
+fn parse_server_list(reader: &mut Cursor<&[u8]>) -> Result<PacketOutcome> {
+    let nonce1 = reader.read_le_u16()?;
+    let _ = reader.read_le_u16()?;
+    let uid = reader.read_bytes::<20>()?;
+    reader.seek(std::io::SeekFrom::Start(0x3a))?;
+    let entry_count = reader.read_le_u16()?;
+    assert!(entry_count != 0);
+    let mut servers = vec![];
+    for _ in 0..entry_count {
+        let entry_type = reader.read_le_u16()?;
+        let entry_size = reader.read_le_u16()? as u64;
+        let entry_offset = reader.position();
+
+        match entry_type {
+            9 => {
+                /* server entries or something */
+                let server_count = entry_size / 0x6C;
+
+                for _ in 0..server_count {
+                    let _ = reader.read_le_u16()?;
+                    let port = reader.read_be_u16()?;
+                    let ip_address: u32 = reader.read_be_u32()?;
+                    let _ = reader.read_le_u64()?;
+
+                    let mut der_key = [0; 0x5c];
+                    reader.read_exact(&mut der_key)?;
+                    let pub_key = PKey::public_key_from_der(&der_key)?;
+
+                    servers.push(ServerEntry {
+                        ip_address: IpAddr::V4(Ipv4Addr::from_bits(ip_address)),
+                        port,
+                        pub_key,
+                    });
+
+                    debug!("Server: {:?}", servers.last());
+                }
+            }
+            1 => {
+                let _unknown1 = reader.read_le_u16()?;
+                let _unknown2 = reader.read_le_u16()?;
+                let _unknown3 = reader.read_le_u16()?;
+                // It looks like those 3 short are reversed: unknown3, unknown2, unknown1.
+            }
+            _ => {
+                warn!("Unknown entry type: {}", entry_type);
+            }
+        }
+
+        reader.set_position(entry_offset + entry_size);
+    }
+
+    Ok(PacketOutcome::ServerList {
+        nonce1,
+        uid,
+        servers,
+    })
+}
+
+fn parse_p2p_handshake(reader: &mut Cursor<&[u8]>) -> Result<PacketOutcome> {
+    if reader.get_ref().len() < 0x36 {
+        return Err(ParseError::InvalidPacketContentSize.into());
+    }
+    let nonce2 = reader.read_le_u16()?;
+    let _ = reader.read_le_u16()?;
+    let record_sid = reader.read_le_u32()?;
+    let uid = reader.read_bytes::<20>()?;
+    reader.set_position(0x34);
+    let keepalive_interval = reader.read_le_u16()?;
+
+    Ok(PacketOutcome::P2PHandshake {
+        nonce2,
+        uid,
+        record_sid,
+        keepalive_interval,
+    })
+}
+
+fn parse_device_status(reader: &mut Cursor<&[u8]>, packet_header: PacketHeader) -> Result<PacketOutcome> {
+    if reader.get_ref().len() < 20 {
+        return Ok(PacketOutcome::Ignored);
+    }
+
+    let online = packet_header.command == CmdType::DeviceOnlineStatus as u16;
+    let uid = reader.read_bytes::<20>()?;
+    Ok(PacketOutcome::DeviceStatus { online, uid })
+}
+
+fn parse_hello_client(mut reader: Cursor<&[u8]>) -> Result<PacketOutcome> {
+    if reader.get_ref().len() < 16 {
+        return Ok(PacketOutcome::Ignored);
+    }
+
+    let _ = reader.read_le_u16()?;
+    let port = reader.read_be_u16()?;
+    let address: u32 = reader.read_be_u32()?;
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::from_bits(address)), port);
+    let _ = reader.read_le_u64()?;
+    Ok(PacketOutcome::HelloClient { address })
+}
+
 pub(super) fn parse_packet(buffer: &[u8], cypher: PacketCypher) -> Result<PacketOutcome> {
     let (header, content) = buffer
         .split_at_checked(constants::PACKET_HEADER_SIZE)
@@ -535,126 +635,27 @@ pub(super) fn parse_packet(buffer: &[u8], cypher: PacketCypher) -> Result<Packet
             debug!("Received P2P handshake packet");
         }
         CmdType::P2PHandshake => {
-            // The response to the P2PInitHandshakeReq, carried by a type 3
-            // record: the nonce2 echo, the record sid, the device uid, and
-            // the keepalive interval at content offset 0x34.
-            if content.len() < 0x36 {
-                return Err(ParseError::InvalidPacketContentSize.into());
-            }
-
-            let nonce2 = reader.read_le_u16()?;
-            let _ = reader.read_le_u16()?;
-            let record_sid = reader.read_le_u32()?;
-            let uid = reader.read_bytes::<20>()?;
-            let keepalive_interval = Cursor::new(&content[0x34..]).read_le_u16()?;
-
-            return Ok(PacketOutcome::P2PHandshake {
-                nonce2,
-                uid,
-                record_sid,
-                keepalive_interval,
-            });
+            return parse_p2p_handshake(&mut reader);
         }
         CmdType::P2PInitHandshakeResp => {
-            // The master handshake response, carried by a type 1 record:
-            // the nonce1 echo, the device uid, then the entry table at
-            // content offset 0x3a.
-            let nonce1 = reader.read_le_u16()?;
-            let _ = reader.read_le_u16()?;
-            let uid = reader.read_bytes::<20>()?;
-
-            reader.seek(std::io::SeekFrom::Start(0x3a))?;
-            let entry_count = reader.read_le_u16()?;
-            assert!(entry_count != 0);
-
-            let mut servers = vec![];
-
-            for _ in 0..entry_count {
-                let entry_type = reader.read_le_u16()?;
-                let entry_size = reader.read_le_u16()? as u64;
-                let entry_offset = reader.position();
-
-                match entry_type {
-                    9 => {
-                        /* server entries or something */
-                        let server_count = entry_size / 0x6C;
-
-                        for _ in 0..server_count {
-                            let _ = reader.read_le_u16()?;
-                            let port = reader.read_be_u16()?;
-                            let ip_address: u32 = reader.read_be_u32()?;
-                            let _ = reader.read_le_u64()?;
-
-                            let mut der_key = [0; 0x5c];
-                            reader.read_exact(&mut der_key)?;
-                            let pub_key = PKey::public_key_from_der(&der_key)?;
-
-                            servers.push(ServerEntry {
-                                ip_address: IpAddr::V4(Ipv4Addr::from_bits(ip_address)),
-                                port,
-                                pub_key,
-                            });
-
-                            debug!("Server: {:?}", servers.last());
-                        }
-                    }
-                    1 => {
-                        let _unknown1 = reader.read_le_u16()?;
-                        let _unknown2 = reader.read_le_u16()?;
-                        let _unknown3 = reader.read_le_u16()?;
-                        // It looks like those 3 short are reversed: unknown3, unknown2, unknown1.
-                    }
-                    _ => {
-                        warn!("Unknown entry type: {}", entry_type);
-                    }
-                }
-
-                reader.set_position(entry_offset + entry_size);
-            }
-
-            return Ok(PacketOutcome::ServerList {
-                nonce1,
-                uid,
-                servers,
-            });
+            return parse_server_list(&mut reader);
         }
         CmdType::KeyPush => {
             debug!("Received P2P session packet");
         }
         CmdType::DeviceOfflineStatus | CmdType::DeviceOnlineStatus => {
-            // From _IOTC_Packet_Handler: the content starts with the
-            // 20-byte device uid; 0x227 reports the device as not
-            // connected to this server, 0x229 as connected.
-            if content.len() >= 20 {
-                let online = packet_header.command == CmdType::DeviceOnlineStatus as u16;
-                let uid: [u8; 20] = content[..20].try_into().unwrap();
-                return Ok(PacketOutcome::DeviceStatus { online, uid });
-            }
+            return parse_device_status(&mut reader, packet_header);
         }
         CmdType::HelloServer => {
             debug!("Received HelloServer packet");
         }
         CmdType::HelloClient => {
-            // From addNatRecord in libIOTCAPIs.so: a sockaddr_in followed
-            // by 8 unknown bytes, carrying our public address as seen by
-            // the server.
-            if content.len() >= 16 {
-                let _ = reader.read_le_u16()?; // Probably the af type?
-                let port = reader.read_be_u16()?;
-                let address: u32 = reader.read_be_u32()?;
-                let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::from_bits(address)), port);
-                let _ = reader.read_le_u64()?; // unknown
-
-                return Ok(PacketOutcome::HelloClient { address });
-            }
+            return parse_hello_client(reader);
         }
     }
 
     Ok(PacketOutcome::Ignored)
 }
-
-
-// Session data: identity, credentials, the per-peer table and the parsed facts.
 
 #[cfg(test)]
 mod tests {
